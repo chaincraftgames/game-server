@@ -1,0 +1,28 @@
+{
+  "name": "@chaincraft/game-server",
+  "version": "0.1.0",
+  "description": "ChainCraft game server — hosts game sessions over REST + WebSocket",
+  "type": "module",
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "@chaincraft/gamedef": "file:../gamedef",
+    "@chaincraft/runtime": "file:../chaincraft-runtime",
+    "@hono/node-server": "^1.13.0",
+    "@hono/node-ws": "^1.1.0",
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@chaincraft/compiler": "file:../chaincraft-compiler",
+    "@types/node": "^22.19.7",
+    "js-yaml": "^4.2.0",
+    "@types/js-yaml": "^4.0.9",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.3"
+  }
+}
