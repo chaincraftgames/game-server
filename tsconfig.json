@@ -10,7 +10,10 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "declaration": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "#chaincraft/*.js": ["./src/*.ts"]
+    }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules"]

@@ -14,13 +14,17 @@
     "@chaincraft/runtime": "file:../chaincraft-runtime",
     "@hono/node-server": "^1.13.0",
     "@hono/node-ws": "^1.1.0",
-    "hono": "^4.7.0"
+    "hono": "^4.7.0",
+    "zod": "^4.4.3"
+  },
+  "imports": {
+    "#chaincraft/*.js": "./dist/*.js"
   },
   "devDependencies": {
     "@chaincraft/compiler": "file:../chaincraft-compiler",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.19.7",
     "js-yaml": "^4.2.0",
-    "@types/js-yaml": "^4.0.9",
     "rimraf": "^6.0.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.3"

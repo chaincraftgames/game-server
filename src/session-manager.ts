@@ -6,94 +6,309 @@
 // push messages over the player's socket.
 // ---------------------------------------------------------------------------
 
-import { GameController } from '@chaincraft/runtime';
-import type { CompiledGameModule, Message } from '@chaincraft/runtime';
-import type { PlayerInputSuspension, GameOutcome } from '@chaincraft/runtime';
-import type { WSContext } from 'hono/ws';
+import { GameController } from "@chaincraft/runtime";
+import type {
+  CompiledGameModule,
+  Message,
+  PlayerCount,
+} from "@chaincraft/runtime";
+import type { PlayerInputSuspension, GameOutcome } from "@chaincraft/runtime";
+import type { WSContext } from "hono/ws";
+import {
+  GameCompleteServerMessage,
+  GameErrorServerMessage,
+  GameMessageServerMessage,
+  PlayerStatusUpdateMessage,
+  PromptServerMessage,
+  SyncServerMessage,
+} from "./api-types.js";
+import type { SessionErrorType } from "./api-types.js";
 
-export interface ManagedSession {
+/** Information about a player in a session. */
+interface PlayerInfo {
+  /** The id of the player as reported by the player when joining. */
   id: string;
+  /** The current state of the player in the session. */
+  playerState: "joined" | "ready" | "playing" | "left";
+  /** A token that can be used to authenticate the player in future requests. */
+  token: string;
+  /** A queue of undelivered messages for the player. */
+  messageQueue: Message[];
+}
+
+export class SessionError extends Error {
+  constructor(public readonly errorType: SessionErrorType, message?: string) {
+    super(message ?? errorType);
+    this.name = "SessionError";
+  }
+}
+
+/**
+ * Represents a game in progress hosted by the server.  This has a different shape than
+ * the GameSession type in the runtime, as it includes server-specific information such as
+ * the join code and connected WebSocket clients.
+ */
+export interface HostedSession {
+  /** The id of the session.  Used to make session-specific requests. */
+  id: string;
+  /**
+   * The id of the game being played. This is the same across all sessions of this
+   * game.
+   */
   gameId: string;
+  /** The join code for the session. */
+  joinCode: string;
+  /** The game controller associated with this session. */
   controller: GameController;
-  players: string[];
+  /** The players in the session, keyed by player ID. */
+  players: Map<string, PlayerInfo>;
+  /** Maps player tokens to player IDs. */
+  playerTokenIndex: Map<string, string>;
+  /** The WebSocket connections for each player, keyed by player ID. */
   sockets: Map<string, WSContext>;
 }
 
-let counter = 0;
-
+/**
+ * SessionManager — manages the lifecycle of GameSessions. Creates sessions,
+ * registers sockets, and routes events to the appropriate players.
+ */
 export class SessionManager {
-  private sessions = new Map<string, ManagedSession>();
+  private sessions = new Map<string, HostedSession>();
+  private playerCount!: PlayerCount;
 
+  /** Create a new session for the given game and players. */
   async createSession(
     gameId: string,
-    players: string[],
     module: CompiledGameModule,
-  ): Promise<ManagedSession> {
-    const sessionId = `${gameId}-${++counter}`;
+  ): Promise<HostedSession> {
+    const sessionId = this.createSessionId(gameId);
+    this.playerCount = module.metadata.playerCount;
     const controller = new GameController(module, {
       events: {
         onPrompt: (prompt) => this.pushToAwaitedPlayers(sessionId, prompt),
-        onMessage: (message) =>
-          this.broadcast(sessionId, { type: 'message', data: message }),
+        onMessage: (message) => this.pushToRecipients(sessionId, message),
         onComplete: (outcome) =>
-          this.broadcast(sessionId, { type: 'complete', data: outcome }),
+          this.broadcast(sessionId, {
+            type: "complete",
+            data: outcome,
+          } satisfies GameCompleteServerMessage),
       },
     });
 
-    const session: ManagedSession = {
+    const session: HostedSession = {
       id: sessionId,
       gameId,
       controller,
-      players,
+      joinCode: this.createJoinCode(),
+      playerTokenIndex: new Map(),
+      players: new Map(),
       sockets: new Map(),
     };
     this.sessions.set(sessionId, session);
 
-    await controller.init(sessionId, players);
+    // await controller.init(sessionId, players);
     return session;
   }
 
-  getSession(sessionId: string): ManagedSession | undefined {
+  /** Get the session associated with the given session ID, if it exists. */
+  getSession(sessionId: string): HostedSession | undefined {
     return this.sessions.get(sessionId);
   }
 
+  /** Remove the session associated with the given session ID. */
   removeSession(sessionId: string): void {
     this.sessions.delete(sessionId);
   }
 
   /** Register a WebSocket for a player and send any pending prompt. */
-  registerSocket(sessionId: string, playerId: string, ws: WSContext): void {
+  connect(
+    sessionId: string,
+    playerId: string,
+    playerToken: string,
+    ws: WSContext,
+  ): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+
+    // Confirm the player token matches the player ID.
+    const expectedToken = session.playerTokenIndex.get(playerId);
+    if (expectedToken !== playerToken) {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          data: { code: "invalid-request", message: "Invalid player token" },
+        } satisfies GameErrorServerMessage),
+      );
+      ws.close(1008, "Invalid player token");
+      return;
+    }
     session.sockets.set(playerId, ws);
 
-    // If a prompt is already pending for this player, push it immediately (reconnect support)
-    const prompt = session.controller.pendingPrompts.get(playerId);
-    if (prompt) {
-      ws.send(JSON.stringify({ type: 'prompt', data: prompt }));
+    // Before init(), the controller has no state — send empty sync.
+    const initialized = session.controller.isInitialized;
+    const projectedState = initialized
+      ? session.controller.projectStateForPlayer(playerId)
+      : undefined;
+    const prompt = initialized
+      ? session.controller.pendingPrompts.get(playerId)
+      : undefined;
+    const playerInfo = session.players.get(playerId);
+    const queuedMessages = playerInfo?.messageQueue ?? [];
+
+    // Send the sync message to the player.
+    ws.send(
+      JSON.stringify({
+        type: "sync",
+        data: {
+          gameState: projectedState,
+          prompt,
+          messages: queuedMessages,
+        },
+      } satisfies SyncServerMessage),
+    );
+
+    // Clear the queued messages for the player.
+    if (playerInfo) {
+      playerInfo.messageQueue = [];
     }
   }
 
-  removeSocket(sessionId: string, playerId: string): void {
+  /** Remove the WebSocket associated with the given player in the specified session. */
+  disconnect(sessionId: string, playerId: string): void {
     this.sessions.get(sessionId)?.sockets.delete(playerId);
   }
 
-  // ---------------------------------------------------------------------------
-  // Internal push helpers
-  // ---------------------------------------------------------------------------
+  /**
+   * Join the player to the session. The join code provided by the player must match
+   * the join code of the session. If the player is already in the session, an error is thrown.
+   */
+  join(session: HostedSession, joinCode: string, playerId: string): string {
+    if (session.playerTokenIndex.has(playerId))
+      throw new SessionError("player-already-joined");
+    if (session.joinCode !== joinCode)
+      throw new SessionError("join-code-not-found");
+    if (session.players.size >= this.playerCount.max)
+      throw new SessionError("no-available-player-slots");
 
+    const token = this.createPlayerToken();
+    session.playerTokenIndex.set(playerId, token);
+    const playerInfo: PlayerInfo = {
+      id: playerId,
+      playerState: "joined",
+      token,
+      messageQueue: [],
+    };
+    session.players.set(playerId, playerInfo);
+    this.broadcast(session.id, {
+      type: "player-status-update",
+      data: {
+        id: playerId,
+        status: "joined",
+      },
+    } satisfies PlayerStatusUpdateMessage);
+    return token;
+  }
+
+  async updatePlayerStatus(
+    sessionId: string,
+    playerId: string,
+    status: "joined" | "ready" | "playing" | "left",
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new SessionError("session-not-found");
+    const playerInfo = session.players.get(playerId);
+    if (!playerInfo) throw new SessionError("player-not-joined");
+    switch (status) {
+      case "joined":
+        throw new SessionError("invalid-message", `Cannot update player status to "joined"`);
+      case "ready":
+        await this.handlePlayerReady(session, playerInfo!);
+        break;
+      case "playing":
+      case "left":
+        break;
+      default:
+        throw new Error(`Invalid player status: ${status}`);
+    }
+    playerInfo!.playerState = status;
+    this.broadcast(sessionId, {
+      type: "player-status-update",
+      data: {
+        id: playerId,
+        status: status,
+      },
+    } satisfies PlayerStatusUpdateMessage);
+  }
+
+  private async handlePlayerReady(session: HostedSession, player: PlayerInfo): Promise<void> {
+    if (session.players.size < this.playerCount.min) return;
+    // If all other players are ready, start the game.
+    let allReady = true;
+    for (const otherPlayer of session.players.values()) {
+      if (otherPlayer.id !== player.id && otherPlayer.playerState !== "ready") {
+        allReady = false;
+        break;
+      }
+    }
+    if (allReady) {
+      await session.controller.init(session.id, Array.from(session.players.keys()));
+      this.syncAllPlayers(session);
+    }
+  }
+
+  /** Send each connected player their projected state after game starts. */
+  private syncAllPlayers(session: HostedSession): void {
+    for (const [playerId, ws] of session.sockets) {
+      const prompt = session.controller.pendingPrompts.get(playerId);
+      ws.send(
+        JSON.stringify({
+          type: "sync",
+          data: {
+            gameState: session.controller.projectStateForPlayer(playerId),
+            prompt,
+            messages: [],
+          },
+        } satisfies SyncServerMessage),
+      );
+    }
+  }
+
+  /** Push a prompt to the player who is awaiting input. */
   private pushToAwaitedPlayers(
     sessionId: string,
     prompt: PlayerInputSuspension,
   ): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    for (const playerId of prompt.awaiting) {
+    const ws = session.sockets.get(prompt.awaiting);
+    if (ws)
+      ws.send(
+        JSON.stringify({
+          type: "prompt",
+          data: prompt,
+        } satisfies PromptServerMessage),
+      );
+  }
+
+  /**
+   * Push a game message to each player in `message.recipients`.
+   * Recipients are already resolved by the runtime (see executeMessage) — the
+   * server never needs to interpret the symbolic `to` value itself.
+   */
+  private pushToRecipients(sessionId: string, message: Message): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const payload = JSON.stringify({
+      type: "message",
+      data: message,
+    } satisfies GameMessageServerMessage);
+    for (const playerId of message.recipients) {
       const ws = session.sockets.get(playerId);
-      if (ws) ws.send(JSON.stringify({ type: 'prompt', data: prompt }));
+      if (ws) ws.send(payload);
     }
   }
 
+  /** Send a message to all players in the session. */
   private broadcast(sessionId: string, message: unknown): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -101,5 +316,28 @@ export class SessionManager {
     for (const ws of session.sockets.values()) {
       ws.send(payload);
     }
+  }
+
+
+
+  /** Generate a short random session id prefixed with the game ID. */
+  private createSessionId(gameId: string): string {
+    // Sessions are short-lived so 5 random chars (36^5 ≈ 60M) keeps collision risk negligible.
+    return Array.from(crypto.getRandomValues(new Uint8Array(5)))
+      .map((b) => (b % 36).toString(36))
+      .join("");
+  }
+
+  /** Generate a short random join code. */
+  private createJoinCode(): string {
+    // Join codes are short-lived so 4 random chars (36^4 ≈ 1.6M) keeps collision risk negligible.
+    return Array.from(crypto.getRandomValues(new Uint8Array(4)))
+      .map((b) => (b % 36).toString(36))
+      .join("");
+  }
+
+  /** Generate a secure player token. */
+  private createPlayerToken(): string {
+    return crypto.randomUUID();
   }
 }

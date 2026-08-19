@@ -7,20 +7,20 @@
 // This is a devDependency-only path — production uses BundleModuleLoader.
 // ---------------------------------------------------------------------------
 
-import { readFileSync, readdirSync } from 'fs';
-import { join, basename, extname } from 'path';
-import { load } from 'js-yaml';
-import { validate } from '@chaincraft/gamedef/validator';
-import type { ModularGameSpec } from '@chaincraft/gamedef';
-import { assembleModule } from '@chaincraft/compiler';
-import type { ModuleLoader } from './module-loader.js';
+import { readFileSync, readdirSync } from "fs";
+import { join, basename, extname } from "path";
+import { load } from "js-yaml";
+import { validate } from "@chaincraft/gamedef/validator";
+import type { ModularGameSpec } from "@chaincraft/gamedef";
+import { assembleModule } from "@chaincraft/compiler";
+import type { ModuleLoader } from "./module-loader.js";
 
 export class SpecModuleLoader implements ModuleLoader {
   constructor(private readonly gamesDir: string) {}
 
   async load(gameId: string) {
     const filePath = join(this.gamesDir, `${gameId}.yaml`);
-    const raw = load(readFileSync(filePath, 'utf-8'));
+    const raw = load(readFileSync(filePath, "utf-8"));
     const result = validate(raw);
     if (!result.valid) {
       throw new Error(
@@ -32,7 +32,7 @@ export class SpecModuleLoader implements ModuleLoader {
 
   listGames(): string[] {
     return readdirSync(this.gamesDir)
-      .filter((f) => extname(f) === '.yaml')
-      .map((f) => basename(f, '.yaml'));
+      .filter((f) => extname(f) === ".yaml")
+      .map((f) => basename(f, ".yaml"));
   }
 }
