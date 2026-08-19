@@ -20,9 +20,10 @@ import {
   GameMessageServerMessage,
   PlayerStatusUpdateMessage,
   PromptServerMessage,
+  StateChangeServerMessage,
   SyncServerMessage,
 } from "./api-types.js";
-import type { SessionErrorType } from "./api-types.js";
+import type { SessionErrorType, StateChangeEvent } from "./api-types.js";
 
 /** Information about a player in a session. */
 interface PlayerInfo {
@@ -56,6 +57,8 @@ export interface HostedSession {
    * game.
    */
   gameId: string;
+  /** How many players the game supports. */
+  playerCount: PlayerCount;
   /** The join code for the session. */
   joinCode: string;
   /** The game controller associated with this session. */
@@ -66,6 +69,10 @@ export interface HostedSession {
   playerTokenIndex: Map<string, string>;
   /** The WebSocket connections for each player, keyed by player ID. */
   sockets: Map<string, WSContext>;
+  /** Monotonic counter for state-change batches. */
+  stateChangeSeq: number;
+  /** Monotonic counter for game messages. */
+  messageSeq: number;
 }
 
 /**
@@ -74,7 +81,6 @@ export interface HostedSession {
  */
 export class SessionManager {
   private sessions = new Map<string, HostedSession>();
-  private playerCount!: PlayerCount;
 
   /** Create a new session for the given game and players. */
   async createSession(
@@ -82,7 +88,7 @@ export class SessionManager {
     module: CompiledGameModule,
   ): Promise<HostedSession> {
     const sessionId = this.createSessionId(gameId);
-    this.playerCount = module.metadata.playerCount;
+    const playerCount = module.metadata.playerCount;
     const controller = new GameController(module, {
       events: {
         onPrompt: (prompt) => this.pushToAwaitedPlayers(sessionId, prompt),
@@ -92,17 +98,21 @@ export class SessionManager {
             type: "complete",
             data: outcome,
           } satisfies GameCompleteServerMessage),
+        onStateChange: (changes) => this.pushStateChanges(sessionId, changes),
       },
     });
 
     const session: HostedSession = {
       id: sessionId,
       gameId,
+      playerCount,
       controller,
       joinCode: this.createJoinCode(),
       playerTokenIndex: new Map(),
       players: new Map(),
       sockets: new Map(),
+      stateChangeSeq: 0,
+      messageSeq: 0,
     };
     this.sessions.set(sessionId, session);
 
@@ -163,6 +173,8 @@ export class SessionManager {
           gameState: projectedState,
           prompt,
           messages: queuedMessages,
+          stateChangeSeq: session.stateChangeSeq,
+          messageSeq: session.messageSeq,
         },
       } satisfies SyncServerMessage),
     );
@@ -187,7 +199,7 @@ export class SessionManager {
       throw new SessionError("player-already-joined");
     if (session.joinCode !== joinCode)
       throw new SessionError("join-code-not-found");
-    if (session.players.size >= this.playerCount.max)
+    if (session.players.size >= session.playerCount.max)
       throw new SessionError("no-available-player-slots");
 
     const token = this.createPlayerToken();
@@ -241,7 +253,7 @@ export class SessionManager {
   }
 
   private async handlePlayerReady(session: HostedSession, player: PlayerInfo): Promise<void> {
-    if (session.players.size < this.playerCount.min) return;
+    if (session.players.size < session.playerCount.min) return;
     // If all other players are ready, start the game.
     let allReady = true;
     for (const otherPlayer of session.players.values()) {
@@ -267,6 +279,8 @@ export class SessionManager {
             gameState: session.controller.projectStateForPlayer(playerId),
             prompt,
             messages: [],
+            stateChangeSeq: session.stateChangeSeq,
+            messageSeq: session.messageSeq,
           },
         } satisfies SyncServerMessage),
       );
@@ -298,13 +312,30 @@ export class SessionManager {
   private pushToRecipients(sessionId: string, message: Message): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    session.messageSeq++;
     const payload = JSON.stringify({
       type: "message",
+      seq: session.messageSeq,
       data: message,
     } satisfies GameMessageServerMessage);
     for (const playerId of message.recipients) {
       const ws = session.sockets.get(playerId);
       if (ws) ws.send(payload);
+    }
+  }
+
+  /** Broadcast a state-change batch to all connected players. */
+  private pushStateChanges(sessionId: string, changes: StateChangeEvent[]): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.stateChangeSeq++;
+    const payload = JSON.stringify({
+      type: "state-change",
+      seq: session.stateChangeSeq,
+      data: changes,
+    } satisfies StateChangeServerMessage);
+    for (const ws of session.sockets.values()) {
+      ws.send(payload);
     }
   }
 
