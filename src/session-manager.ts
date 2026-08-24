@@ -6,7 +6,9 @@
 // push messages over the player's socket.
 // ---------------------------------------------------------------------------
 
-import { GameController } from "@chaincraft/runtime";
+import { 
+  GameController, 
+} from "@chaincraft/runtime";
 import type {
   CompiledGameModule,
   Message,
@@ -324,18 +326,21 @@ export class SessionManager {
     }
   }
 
-  /** Broadcast a state-change batch to all connected players. */
+  /** Send projected state-change events to each connected player. */
   private pushStateChanges(sessionId: string, changes: StateChangeEvent[]): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     session.stateChangeSeq++;
-    const payload = JSON.stringify({
-      type: "state-change",
-      seq: session.stateChangeSeq,
-      data: changes,
-    } satisfies StateChangeServerMessage);
-    for (const ws of session.sockets.values()) {
-      ws.send(payload);
+    for (const [playerId, ws] of session.sockets) {
+      const projected = session.controller.projectStateChangesForPlayer(
+        changes as any, playerId,
+      );
+      if (projected.length === 0) continue;
+      ws.send(JSON.stringify({
+        type: "state-change",
+        seq: session.stateChangeSeq,
+        data: projected,
+      } satisfies StateChangeServerMessage));
     }
   }
 
