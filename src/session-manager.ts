@@ -37,6 +37,10 @@ interface PlayerInfo {
   token: string;
   /** A queue of undelivered messages for the player. */
   messageQueue: Message[];
+  /** Per-recipient counter for messages addressed to this player. */
+  messageSeq: number;
+  /** Per-viewer counter for state-change frames delivered to this player. */
+  stateChangeSeq: number;
 }
 
 export class SessionError extends Error {
@@ -52,6 +56,7 @@ export class SessionError extends Error {
  * the join code and connected WebSocket clients.
  */
 export interface HostedSession {
+  suppressPromptPushes?: boolean;
   /** The id of the session.  Used to make session-specific requests. */
   id: string;
   /**
@@ -71,10 +76,6 @@ export interface HostedSession {
   playerTokenIndex: Map<string, string>;
   /** The WebSocket connections for each player, keyed by player ID. */
   sockets: Map<string, WSContext>;
-  /** Monotonic counter for state-change batches. */
-  stateChangeSeq: number;
-  /** Monotonic counter for game messages. */
-  messageSeq: number;
 }
 
 /**
@@ -93,8 +94,8 @@ export class SessionManager {
     const playerCount = module.metadata.playerCount;
     const controller = new GameController(module, {
       events: {
-        onPrompt: (prompt) => this.pushToAwaitedPlayers(sessionId, prompt),
-        onMessage: (message) => this.pushToRecipients(sessionId, message),
+        onPrompt: (prompt) => this.pushPromptToAwaitedPlayers(sessionId, prompt),
+        onMessage: (message) => this.pushGameMessageToRecipients(sessionId, message),
         onComplete: (outcome) =>
           this.broadcast(sessionId, {
             type: "complete",
@@ -113,8 +114,6 @@ export class SessionManager {
       playerTokenIndex: new Map(),
       players: new Map(),
       sockets: new Map(),
-      stateChangeSeq: 0,
-      messageSeq: 0,
     };
     this.sessions.set(sessionId, session);
 
@@ -175,8 +174,8 @@ export class SessionManager {
           gameState: projectedState,
           prompt,
           messages: queuedMessages,
-          stateChangeSeq: session.stateChangeSeq,
-          messageSeq: session.messageSeq,
+          stateChangeSeq: playerInfo?.stateChangeSeq ?? 0,
+          messageSeq: playerInfo?.messageSeq ?? 0,
         },
       } satisfies SyncServerMessage),
     );
@@ -211,6 +210,8 @@ export class SessionManager {
       playerState: "joined",
       token,
       messageQueue: [],
+      messageSeq: 0,
+      stateChangeSeq: 0,
     };
     session.players.set(playerId, playerInfo);
     this.broadcast(session.id, {
@@ -265,7 +266,15 @@ export class SessionManager {
       }
     }
     if (allReady) {
-      await session.controller.init(session.id, Array.from(session.players.keys()));
+      if (session.controller.isInitialized) return;
+      // Suppress any prompt pushes on init, since the syncAllPlayers() call will 
+      // send the initial prompt to each player.
+      session.suppressPromptPushes = true;
+      try {
+        await session.controller.init(session.id, Array.from(session.players.keys()));
+      } finally {
+        session.suppressPromptPushes = false;
+      }
       this.syncAllPlayers(session);
     }
   }
@@ -273,6 +282,7 @@ export class SessionManager {
   /** Send each connected player their projected state after game starts. */
   private syncAllPlayers(session: HostedSession): void {
     for (const [playerId, ws] of session.sockets) {
+      const playerInfo = session.players.get(playerId);
       const prompt = session.controller.pendingPrompts.get(playerId);
       ws.send(
         JSON.stringify({
@@ -281,8 +291,8 @@ export class SessionManager {
             gameState: session.controller.projectStateForPlayer(playerId),
             prompt,
             messages: [],
-            stateChangeSeq: session.stateChangeSeq,
-            messageSeq: session.messageSeq,
+            stateChangeSeq: playerInfo?.stateChangeSeq ?? 0,
+            messageSeq: playerInfo?.messageSeq ?? 0,
           },
         } satisfies SyncServerMessage),
       );
@@ -290,12 +300,12 @@ export class SessionManager {
   }
 
   /** Push a prompt to the player who is awaiting input. */
-  private pushToAwaitedPlayers(
+  private pushPromptToAwaitedPlayers(
     sessionId: string,
     prompt: PlayerInputSuspension,
   ): void {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    if (!session || session.suppressPromptPushes) return;
     const ws = session.sockets.get(prompt.awaiting);
     if (ws)
       ws.send(
@@ -311,18 +321,26 @@ export class SessionManager {
    * Recipients are already resolved by the runtime (see executeMessage) — the
    * server never needs to interpret the symbolic `to` value itself.
    */
-  private pushToRecipients(sessionId: string, message: Message): void {
+  private pushGameMessageToRecipients(sessionId: string, message: Message): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    session.messageSeq++;
-    const payload = JSON.stringify({
-      type: "message",
-      seq: session.messageSeq,
-      data: message,
-    } satisfies GameMessageServerMessage);
     for (const playerId of message.recipients) {
+      const playerInfo = session.players.get(playerId);
+      if (!playerInfo) continue;
+      // Seq counts messages addressed to this seat whether delivered or queued,
+      // so a client-detected gap means it genuinely missed one of its own.
+      playerInfo.messageSeq++;
       const ws = session.sockets.get(playerId);
-      if (ws) ws.send(payload);
+      if (ws) {
+        ws.send(JSON.stringify({
+          type: "message",
+          seq: playerInfo.messageSeq,
+          data: message,
+        } satisfies GameMessageServerMessage));
+      } else {
+        // Not connected — queue for redelivery on reconnect sync.
+        playerInfo.messageQueue.push(message);
+      }
     }
   }
 
@@ -330,15 +348,19 @@ export class SessionManager {
   private pushStateChanges(sessionId: string, changes: StateChangeEvent[]): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    session.stateChangeSeq++;
     for (const [playerId, ws] of session.sockets) {
       const projected = session.controller.projectStateChangesForPlayer(
         changes as any, playerId,
       );
       if (projected.length === 0) continue;
+      const playerInfo = session.players.get(playerId);
+      if (!playerInfo) continue;
+      // Seq advances only on frames this seat actually receives, so an empty
+      // projection doesn't leave a phantom gap that triggers a resync.
+      playerInfo.stateChangeSeq++;
       ws.send(JSON.stringify({
         type: "state-change",
-        seq: session.stateChangeSeq,
+        seq: playerInfo.stateChangeSeq,
         data: projected,
       } satisfies StateChangeServerMessage));
     }
