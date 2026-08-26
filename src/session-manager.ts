@@ -317,6 +317,34 @@ export class SessionManager {
   }
 
   /**
+   * Interpolate `{{game.<prop>}}` and `{{game.<prop>[N]}}` tokens in a message
+   * content string against the current game state.  The runtime's template
+   * renderer resolves `state.game.property.*` paths but does not yet handle
+   * the shorthand `game.*` path (including array-index notation) used by
+   * onVictory messages such as `{{game.winners[0]}}`.  This method fills that
+   * gap at the server boundary so players never see raw markup.
+   */
+  private interpolateMessageContent(content: string, session: HostedSession): string {
+    if (!content.includes("{{")) return content;
+    const state = session.controller.getState();
+    return content.replace(/\{\{([^}]+)\}\}/g, (original, raw: string) => {
+      const trimmed = raw.trim();
+      // Match game.<propName> with an optional [N] array index.
+      const m = trimmed.match(/^game\.([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$/);
+      if (!m) return original;
+      const [, propName, indexStr] = m;
+      const val = state.gameProperties[propName];
+      if (val === undefined || val === null) return original;
+      if (indexStr !== undefined) {
+        if (!Array.isArray(val)) return original;
+        const item = val[parseInt(indexStr, 10)];
+        return item !== undefined && item !== null ? String(item) : original;
+      }
+      return String(val);
+    });
+  }
+
+  /**
    * Push a game message to each player in `message.recipients`.
    * Recipients are already resolved by the runtime (see executeMessage) — the
    * server never needs to interpret the symbolic `to` value itself.
@@ -324,7 +352,12 @@ export class SessionManager {
   private pushGameMessageToRecipients(sessionId: string, message: Message): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    for (const playerId of message.recipients) {
+    const interpolatedContent = this.interpolateMessageContent(message.content, session);
+    const deliveredMessage: Message =
+      interpolatedContent !== message.content
+        ? { ...message, content: interpolatedContent }
+        : message;
+    for (const playerId of deliveredMessage.recipients) {
       const playerInfo = session.players.get(playerId);
       if (!playerInfo) continue;
       // Seq counts messages addressed to this seat whether delivered or queued,
@@ -335,11 +368,11 @@ export class SessionManager {
         ws.send(JSON.stringify({
           type: "message",
           seq: playerInfo.messageSeq,
-          data: message,
+          data: deliveredMessage,
         } satisfies GameMessageServerMessage));
       } else {
         // Not connected — queue for redelivery on reconnect sync.
-        playerInfo.messageQueue.push(message);
+        playerInfo.messageQueue.push(deliveredMessage);
       }
     }
   }
