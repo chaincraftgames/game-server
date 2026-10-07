@@ -6,26 +6,28 @@
 // push messages over the player's socket.
 // ---------------------------------------------------------------------------
 
-import { 
-  GameController, 
-} from "@chaincraft/runtime";
+import type { WSContext } from "hono/ws";
+
+import { GameController } from "@chaincraft/runtime";
 import type {
   CompiledGameModule,
   Message,
   PlayerCount,
 } from "@chaincraft/runtime";
 import type { PlayerInputSuspension, GameOutcome } from "@chaincraft/runtime";
-import type { WSContext } from "hono/ws";
 import {
   GameCompleteServerMessage,
-  GameErrorServerMessage,
   GameMessageServerMessage,
   PlayerStatusUpdateMessage,
   PromptServerMessage,
   StateChangeServerMessage,
   SyncServerMessage,
-} from "./api-types.js";
-import type { SessionErrorType, StateChangeEvent } from "./api-types.js";
+} from "#chaincraft/api-types.js";
+import type {
+  ErrorPayload,
+  SessionErrorType,
+  StateChangeEvent,
+} from "#chaincraft/api-types.js";
 
 /** Information about a player in a session. */
 interface PlayerInfo {
@@ -44,10 +46,36 @@ interface PlayerInfo {
 }
 
 export class SessionError extends Error {
-  constructor(public readonly errorType: SessionErrorType, message?: string) {
+  constructor(
+    public readonly errorType: SessionErrorType,
+    message?: string,
+    public readonly details?: unknown,
+  ) {
     super(message ?? errorType);
     this.name = "SessionError";
   }
+}
+
+/**
+ * Maps any thrown value to the wire error payload. Non-SessionErrors get `fallback`;
+ * their message is only exposed when the fallback is not internal-error.
+ */
+export function toErrorPayload(
+  e: unknown,
+  fallback: SessionErrorType,
+): ErrorPayload {
+  if (e instanceof SessionError) {
+    return e.details === undefined
+      ? { code: e.errorType, message: e.message }
+      : { code: e.errorType, message: e.message, details: e.details };
+  }
+  if (fallback === "internal-error") {
+    return { code: fallback, message: "Internal server error" };
+  }
+  return {
+    code: fallback,
+    message: e instanceof Error ? e.message : "Unknown error",
+  };
 }
 
 /**
@@ -56,7 +84,10 @@ export class SessionError extends Error {
  * the join code and connected WebSocket clients.
  */
 export interface HostedSession {
-  suppressPromptPushes?: boolean;
+  /** True while controller.init() runs; sync delivers the initial prompt and state. */
+  starting?: boolean;
+  /** Tail of the session's serial work queue. Never rejects. */
+  work: Promise<void>;
   /** The id of the session.  Used to make session-specific requests. */
   id: string;
   /**
@@ -72,8 +103,16 @@ export interface HostedSession {
   controller: GameController;
   /** The players in the session, keyed by player ID. */
   players: Map<string, PlayerInfo>;
-  /** Maps player tokens to player IDs. */
-  playerTokenIndex: Map<string, string>;
+  /**
+   * Maps player tokens to player IDs. Key is player id, value is the corresponding
+   * token.
+   */
+  playerTokensByPlayerId: Map<string, string>;
+  /**
+   * Maps player IDs to player tokens. Key is player token, value is the corresponding
+   * player ID.
+   */
+  playerIdsByPlayerToken: Map<string, string>;
   /** The WebSocket connections for each player, keyed by player ID. */
   sockets: Map<string, WSContext>;
 }
@@ -94,8 +133,10 @@ export class SessionManager {
     const playerCount = module.metadata.playerCount;
     const controller = new GameController(module, {
       events: {
-        onPrompt: (prompt) => this.pushPromptToAwaitedPlayers(sessionId, prompt),
-        onMessage: (message) => this.pushGameMessageToRecipients(sessionId, message),
+        onPrompt: (prompt) =>
+          this.pushPromptToAwaitedPlayers(sessionId, prompt),
+        onMessage: (message) =>
+          this.pushGameMessageToRecipients(sessionId, message),
         onComplete: (outcome) =>
           this.broadcast(sessionId, {
             type: "complete",
@@ -111,9 +152,11 @@ export class SessionManager {
       playerCount,
       controller,
       joinCode: this.createJoinCode(),
-      playerTokenIndex: new Map(),
+      playerTokensByPlayerId: new Map(),
+      playerIdsByPlayerToken: new Map(),
       players: new Map(),
       sockets: new Map(),
+      work: Promise.resolve(),
     };
     this.sessions.set(sessionId, session);
 
@@ -131,59 +174,99 @@ export class SessionManager {
     this.sessions.delete(sessionId);
   }
 
-  /** Register a WebSocket for a player and send any pending prompt. */
-  connect(
+  /**
+   * Run `fn` after all previously queued work for the session has settled, so
+   * no two operations ever interleave across an await.
+   */
+  runExclusive<T>(
+    session: HostedSession,
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    const run = session.work.then(fn);
+    session.work = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Verify the player's token for the session. Returns the session on success. */
+  authenticate(
     sessionId: string,
     playerId: string,
     playerToken: string,
-    ws: WSContext,
-  ): void {
+  ): HostedSession {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    if (!session)
+      throw new SessionError("session-not-found", "Session not found");
+    if (!session.players.has(playerId))
+      throw new SessionError("player-not-joined", "Player not in session");
+    if (session.playerTokensByPlayerId.get(playerId) !== playerToken)
+      throw new SessionError("unauthorized", "Invalid player token");
+    return session;
+  }
 
-    // Confirm the player token matches the player ID.
-    const expectedToken = session.playerTokenIndex.get(playerId);
-    if (expectedToken !== playerToken) {
+  /**
+   * Register an authenticated player's WebSocket and send them a sync. Queued so the
+   * sync is a consistent cut: never taken mid-action, and every later frame follows it.
+   */
+  connect(
+    session: HostedSession,
+    playerId: string,
+    ws: WSContext,
+  ): Promise<void> {
+    return this.runExclusive(session, () => {
+      session.sockets.set(playerId, ws);
+
+      // Before init(), the controller has no state — send empty sync.
+      const initialized = session.controller.isInitialized;
+      const projectedState = initialized
+        ? session.controller.projectStateForPlayer(playerId)
+        : undefined;
+      const prompt = initialized
+        ? session.controller.pendingPrompts.get(playerId)
+        : undefined;
+      const playerInfo = session.players.get(playerId);
+      const queuedMessages = playerInfo?.messageQueue ?? [];
+
+      // Send the sync message to the player.
       ws.send(
         JSON.stringify({
-          type: "error",
-          data: { code: "invalid-request", message: "Invalid player token" },
-        } satisfies GameErrorServerMessage),
+          type: "sync",
+          data: {
+            gameState: projectedState,
+            prompt,
+            messages: queuedMessages,
+            stateChangeSeq: playerInfo?.stateChangeSeq ?? 0,
+            messageSeq: playerInfo?.messageSeq ?? 0,
+          },
+        } satisfies SyncServerMessage),
       );
-      ws.close(1008, "Invalid player token");
-      return;
-    }
-    session.sockets.set(playerId, ws);
 
-    // Before init(), the controller has no state — send empty sync.
-    const initialized = session.controller.isInitialized;
-    const projectedState = initialized
-      ? session.controller.projectStateForPlayer(playerId)
-      : undefined;
-    const prompt = initialized
-      ? session.controller.pendingPrompts.get(playerId)
-      : undefined;
-    const playerInfo = session.players.get(playerId);
-    const queuedMessages = playerInfo?.messageQueue ?? [];
+      // Clear the queued messages for the player.
+      if (playerInfo) {
+        playerInfo.messageQueue = [];
+      }
+    });
+  }
 
-    // Send the sync message to the player.
-    ws.send(
-      JSON.stringify({
-        type: "sync",
-        data: {
-          gameState: projectedState,
-          prompt,
-          messages: queuedMessages,
-          stateChangeSeq: playerInfo?.stateChangeSeq ?? 0,
-          messageSeq: playerInfo?.messageSeq ?? 0,
-        },
-      } satisfies SyncServerMessage),
-    );
-
-    // Clear the queued messages for the player.
-    if (playerInfo) {
-      playerInfo.messageQueue = [];
-    }
+  /** Apply a player's answer to their pending prompt. */
+  submitPromptResponse(
+    sessionId: string,
+    playerId: string,
+    value: unknown,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return Promise.reject(new SessionError("session-not-found"));
+    return this.runExclusive(session, async () => {
+      if (!session.controller.pendingPrompts.has(playerId)) {
+        throw new SessionError(
+          "not-awaiting-input",
+          `No prompt is awaiting player "${playerId}"`,
+        );
+      }
+      await session.controller.processAction({ playerId, value });
+    });
   }
 
   /** Remove the WebSocket associated with the given player in the specified session. */
@@ -195,67 +278,82 @@ export class SessionManager {
    * Join the player to the session. The join code provided by the player must match
    * the join code of the session. If the player is already in the session, an error is thrown.
    */
-  join(session: HostedSession, joinCode: string, playerId: string): string {
-    if (session.playerTokenIndex.has(playerId))
-      throw new SessionError("player-already-joined");
-    if (session.joinCode !== joinCode)
-      throw new SessionError("join-code-not-found");
-    if (session.players.size >= session.playerCount.max)
-      throw new SessionError("no-available-player-slots");
+  join(
+    session: HostedSession,
+    joinCode: string,
+    playerId: string,
+  ): Promise<string> {
+    return this.runExclusive(session, () => {
+      if (session.playerTokensByPlayerId.has(playerId))
+        throw new SessionError("player-already-joined");
+      if (session.joinCode !== joinCode)
+        throw new SessionError("join-code-not-found");
+      if (session.players.size >= session.playerCount.max)
+        throw new SessionError("no-available-player-slots");
 
-    const token = this.createPlayerToken();
-    session.playerTokenIndex.set(playerId, token);
-    const playerInfo: PlayerInfo = {
-      id: playerId,
-      playerState: "joined",
-      token,
-      messageQueue: [],
-      messageSeq: 0,
-      stateChangeSeq: 0,
-    };
-    session.players.set(playerId, playerInfo);
-    this.broadcast(session.id, {
-      type: "player-status-update",
-      data: {
+      const token = this.createPlayerToken();
+      session.playerTokensByPlayerId.set(playerId, token);
+      session.playerIdsByPlayerToken.set(token, playerId);
+      const playerInfo: PlayerInfo = {
         id: playerId,
-        status: "joined",
-      },
-    } satisfies PlayerStatusUpdateMessage);
-    return token;
+        playerState: "joined",
+        token,
+        messageQueue: [],
+        messageSeq: 0,
+        stateChangeSeq: 0,
+      };
+      session.players.set(playerId, playerInfo);
+      this.broadcast(session.id, {
+        type: "player-status-update",
+        data: {
+          id: playerId,
+          status: "joined",
+        },
+      } satisfies PlayerStatusUpdateMessage);
+      return token;
+    });
   }
 
-  async updatePlayerStatus(
+  updatePlayerStatus(
     sessionId: string,
     playerId: string,
     status: "joined" | "ready" | "playing" | "left",
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new SessionError("session-not-found");
-    const playerInfo = session.players.get(playerId);
-    if (!playerInfo) throw new SessionError("player-not-joined");
-    switch (status) {
-      case "joined":
-        throw new SessionError("invalid-message", `Cannot update player status to "joined"`);
-      case "ready":
-        await this.handlePlayerReady(session, playerInfo!);
-        break;
-      case "playing":
-      case "left":
-        break;
-      default:
-        throw new Error(`Invalid player status: ${status}`);
-    }
-    playerInfo!.playerState = status;
-    this.broadcast(sessionId, {
-      type: "player-status-update",
-      data: {
-        id: playerId,
-        status: status,
-      },
-    } satisfies PlayerStatusUpdateMessage);
+    if (!session) return Promise.reject(new SessionError("session-not-found"));
+    return this.runExclusive(session, async () => {
+      const playerInfo = session.players.get(playerId);
+      if (!playerInfo) throw new SessionError("player-not-joined");
+      switch (status) {
+        case "joined":
+          throw new SessionError(
+            "invalid-message",
+            `Cannot update player status to "joined"`,
+          );
+        case "ready":
+          await this.handlePlayerReady(session, playerInfo);
+          break;
+        case "playing":
+        case "left":
+          break;
+        default:
+          throw new Error(`Invalid player status: ${status}`);
+      }
+      playerInfo.playerState = status;
+      this.broadcast(sessionId, {
+        type: "player-status-update",
+        data: {
+          id: playerId,
+          status: status,
+        },
+      } satisfies PlayerStatusUpdateMessage);
+    });
   }
 
-  private async handlePlayerReady(session: HostedSession, player: PlayerInfo): Promise<void> {
+  private async handlePlayerReady(
+    session: HostedSession,
+    player: PlayerInfo,
+  ): Promise<void> {
     if (session.players.size < session.playerCount.min) return;
     // If all other players are ready, start the game.
     let allReady = true;
@@ -267,13 +365,15 @@ export class SessionManager {
     }
     if (allReady) {
       if (session.controller.isInitialized) return;
-      // Suppress any prompt pushes on init, since the syncAllPlayers() call will 
-      // send the initial prompt to each player.
-      session.suppressPromptPushes = true;
+      // Suppress prompt and state-change pushes during init; syncAllPlayers() delivers both.
+      session.starting = true;
       try {
-        await session.controller.init(session.id, Array.from(session.players.keys()));
+        await session.controller.init(
+          session.id,
+          Array.from(session.players.keys()),
+        );
       } finally {
-        session.suppressPromptPushes = false;
+        session.starting = false;
       }
       this.syncAllPlayers(session);
     }
@@ -305,7 +405,7 @@ export class SessionManager {
     prompt: PlayerInputSuspension,
   ): void {
     const session = this.sessions.get(sessionId);
-    if (!session || session.suppressPromptPushes) return;
+    if (!session || session.starting) return;
     const ws = session.sockets.get(prompt.awaiting);
     if (ws)
       ws.send(
@@ -321,7 +421,10 @@ export class SessionManager {
    * Recipients are already resolved by the runtime (see executeMessage) — the
    * server never needs to interpret the symbolic `to` value itself.
    */
-  private pushGameMessageToRecipients(sessionId: string, message: Message): void {
+  private pushGameMessageToRecipients(
+    sessionId: string,
+    message: Message,
+  ): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     for (const playerId of message.recipients) {
@@ -332,11 +435,13 @@ export class SessionManager {
       playerInfo.messageSeq++;
       const ws = session.sockets.get(playerId);
       if (ws) {
-        ws.send(JSON.stringify({
-          type: "message",
-          seq: playerInfo.messageSeq,
-          data: message,
-        } satisfies GameMessageServerMessage));
+        ws.send(
+          JSON.stringify({
+            type: "message",
+            seq: playerInfo.messageSeq,
+            data: message,
+          } satisfies GameMessageServerMessage),
+        );
       } else {
         // Not connected — queue for redelivery on reconnect sync.
         playerInfo.messageQueue.push(message);
@@ -345,12 +450,16 @@ export class SessionManager {
   }
 
   /** Send projected state-change events to each connected player. */
-  private pushStateChanges(sessionId: string, changes: StateChangeEvent[]): void {
+  private pushStateChanges(
+    sessionId: string,
+    changes: StateChangeEvent[],
+  ): void {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    if (!session || session.starting) return;
     for (const [playerId, ws] of session.sockets) {
       const projected = session.controller.projectStateChangesForPlayer(
-        changes as any, playerId,
+        changes as any,
+        playerId,
       );
       if (projected.length === 0) continue;
       const playerInfo = session.players.get(playerId);
@@ -358,11 +467,13 @@ export class SessionManager {
       // Seq advances only on frames this seat actually receives, so an empty
       // projection doesn't leave a phantom gap that triggers a resync.
       playerInfo.stateChangeSeq++;
-      ws.send(JSON.stringify({
-        type: "state-change",
-        seq: playerInfo.stateChangeSeq,
-        data: projected,
-      } satisfies StateChangeServerMessage));
+      ws.send(
+        JSON.stringify({
+          type: "state-change",
+          seq: playerInfo.stateChangeSeq,
+          data: projected,
+        } satisfies StateChangeServerMessage),
+      );
     }
   }
 
@@ -375,8 +486,6 @@ export class SessionManager {
       ws.send(payload);
     }
   }
-
-
 
   /** Generate a short random session id prefixed with the game ID. */
   private createSessionId(gameId: string): string {

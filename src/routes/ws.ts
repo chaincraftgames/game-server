@@ -8,9 +8,12 @@
 
 import { createNodeWebSocket } from "@hono/node-ws";
 import type { Hono } from "hono";
-import { SessionManager, SessionError } from "#chaincraft/session-manager.js";
-import { ClientMessageSchema, GameErrorServerMessage } from "#chaincraft/api-types.js";
-import type { SessionErrorType } from "#chaincraft/api-types.js";
+import { SessionManager, toErrorPayload } from "#chaincraft/session-manager.js";
+import {
+  ClientMessageSchema,
+  GameErrorServerMessage,
+} from "#chaincraft/api-types.js";
+import type { ErrorPayload } from "#chaincraft/api-types.js";
 import { WSContext } from "hono/ws";
 
 /** Register the WebSocket route for game session events. */
@@ -28,30 +31,45 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
       const sessionId = wsContext.req.param("sessionId");
       const playerId = wsContext.req.query("playerId");
       const playerToken = wsContext.req.query("playerToken");
+      // Messages can arrive before a rejected socket finishes closing.
+      let authenticated = false;
 
       return {
-        onOpen(_evt, wsContext) {
+        async onOpen(_evt, wsContext) {
           if (!sessionId || !playerId || !playerToken) {
-            sendError(wsContext, "invalid-request", "sessionId, playerId and playerToken required");
+            sendError(wsContext, {
+              code: "invalid-request",
+              message: "sessionId, playerId and playerToken required",
+            });
             wsContext.close(1008, "Missing params");
             return;
           }
-          const session = sessions.getSession(sessionId);
-          if (!session) {
-            sendError(wsContext, "session-not-found", "Session not found");
-            wsContext.close(1008, "No session");
+          let session;
+          try {
+            session = sessions.authenticate(sessionId, playerId, playerToken);
+          } catch (e) {
+            sendError(wsContext, toErrorPayload(e, "internal-error"));
+            wsContext.close(1008, "Not authorized");
             return;
           }
-          if (!session.players.has(playerId)) {
-            sendError(wsContext, "player-not-joined", "Player not in session");
-            wsContext.close(1008, "Not a player");
-            return;
+          authenticated = true;
+          try {
+            await sessions.connect(session, playerId, wsContext);
+          } catch (e) {
+            console.error("WS connect failed", e);
+            sendError(wsContext, toErrorPayload(e, "internal-error"));
           }
-          sessions.connect(sessionId, playerId, playerToken,wsContext);
         },
 
         async onMessage(evt, wsContext) {
           if (!sessionId || !playerId) return;
+          if (!authenticated) {
+            sendError(wsContext, {
+              code: "unauthorized",
+              message: "Not authenticated",
+            });
+            return;
+          }
           try {
             const raw = JSON.parse(
               typeof evt.data === "string" ? evt.data : evt.data.toString(),
@@ -60,36 +78,35 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
             // Validate incoming message against the schema
             const parsed = ClientMessageSchema.safeParse(raw);
             if (!parsed.success) {
-              sendError(
-                wsContext,
-                "invalid-request",
-                `Invalid message: ${parsed.error.issues.map((i) => i.message).join(", ")}`,
-              );
+              sendError(wsContext, {
+                code: "invalid-request",
+                message: `Invalid message: ${parsed.error.issues.map((i) => i.message).join(", ")}`,
+              });
               return;
             }
 
             const msg = parsed.data;
             switch (msg.type) {
               case "player-status-update":
-                sessions.updatePlayerStatus(sessionId, playerId, msg.data.status);
-                break;  
-              case "prompt-response":
-                const session = sessions.getSession(sessionId);
-                if (!session) return;
-                await session.controller.processAction({
+                await sessions.updatePlayerStatus(
+                  sessionId,
                   playerId,
-                  value: msg.data.value,
-                });
+                  msg.data.status,
+                );
+                break;
+              case "prompt-response":
+                await sessions.submitPromptResponse(
+                  sessionId,
+                  playerId,
+                  msg.data.value,
+                );
                 break;
               default:
                 msg satisfies never;
             }
           } catch (e) {
-            if (e instanceof SessionError) {
-              sendError(wsContext, e.errorType, e.message);
-            } else {
-              sendError(wsContext, "invalid-request", e instanceof Error ? e.message : "Unknown error");
-            }
+            // Runtime input rejections are plain Errors until WS3 adds illegal-action.
+            sendError(wsContext, toErrorPayload(e, "invalid-request"));
           }
         },
 
@@ -105,11 +122,11 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
   return { injectWebSocket };
 }
 
-function sendError(ws: WSContext, code: SessionErrorType, message: string) {
+function sendError(ws: WSContext, error: ErrorPayload) {
   ws.send(
     JSON.stringify({
       type: "error",
-      data: { code, message },
+      data: error,
     } satisfies GameErrorServerMessage),
   );
 }

@@ -147,25 +147,9 @@ export interface JoinSessionResponse {
   token: string;
 }
 
-/** Response to a get session state request. */
-export const GetSessionStateResponseSchema = z.object({
-  state: z.unknown(),
-});
-export type GetSessionStateResponse = z.infer<
-  typeof GetSessionStateResponseSchema
->;
-
-/** Response to a get session prompts request. */
-export const GetSessionPromptsResponseSchema = z.object({
-  prompts: z.array(z.unknown()),
-});
-export type GetSessionPromptsResponse = z.infer<
-  typeof GetSessionPromptsResponseSchema
->;
-
-/** Error response from the server. */
+/** Error response from the server. Same payload as the WS `error` frame's data. */
 export interface ServerErrorResponse {
-  error: string;
+  error: ErrorPayload;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,20 +234,28 @@ export interface GameCompleteServerMessage {
 
 export type SessionErrorType =
   | "session-not-found"
+  | "game-not-found"
   | "player-already-joined"
   | "join-code-not-found"
   | "player-not-joined"
   | "no-available-player-slots"
+  | "not-awaiting-input"
+  | "unauthorized"
   | "invalid-message"
-  | "invalid-request";
+  | "invalid-request"
+  | "internal-error";
+
+/** Error payload shared by REST error responses and WS error frames. */
+export interface ErrorPayload {
+  code: SessionErrorType;
+  message: string;
+  details?: unknown;
+}
 
 /** Server encountered an error processing a client message. */
 export interface GameErrorServerMessage {
   type: "error";
-  data: {
-    code: SessionErrorType;
-    message: string;
-  };
+  data: ErrorPayload;
 }
 
 /** All server → client message shapes. */

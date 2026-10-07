@@ -2,17 +2,37 @@
 // REST routes — session lifecycle
 // ---------------------------------------------------------------------------
 
-import { Hono } from 'hono';
-import type { ModuleLoader } from '../module-loader.js';
-import { SessionManager, SessionError } from '../session-manager.js';
+import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { ModuleLoader } from "../module-loader.js";
+import {
+  SessionManager,
+  SessionError,
+  toErrorPayload,
+} from "#chaincraft/session-manager.js";
 import {
   JoinSessionRequestSchema,
   ServerErrorResponse,
-} from '#chaincraft/api-types.js';
-import type { 
-  CreateSessionRequest, 
-  JoinSessionResponse 
-} from '#chaincraft/api-types.js';
+} from "#chaincraft/api-types.js";
+import type {
+  CreateSessionRequest,
+  JoinSessionResponse,
+  SessionErrorType,
+} from "#chaincraft/api-types.js";
+
+function httpStatusFor(code: SessionErrorType): ContentfulStatusCode {
+  switch (code) {
+    case "session-not-found":
+    case "game-not-found":
+      return 404;
+    case "unauthorized":
+      return 401;
+    case "internal-error":
+      return 500;
+    default:
+      return 400;
+  }
+}
 
 export function createSessionRoutes(
   loader: ModuleLoader,
@@ -20,10 +40,20 @@ export function createSessionRoutes(
 ) {
   const app = new Hono();
 
+  app.onError((e, c) => {
+    const payload = toErrorPayload(e, "internal-error");
+    if (payload.code === "internal-error")
+      console.error("REST request failed", e);
+    return c.json(
+      { error: payload } satisfies ServerErrorResponse,
+      httpStatusFor(payload.code),
+    );
+  });
+
   // ---------------------------------------------------------------------------
   // REST route: GET /games — List available games.
   // ---------------------------------------------------------------------------
-  app.get('/games', async (c) => {
+  app.get("/games", async (c) => {
     const games = await loader.listGames();
     return c.json({ games });
   });
@@ -31,73 +61,44 @@ export function createSessionRoutes(
   // ---------------------------------------------------------------------------
   // REST route: POST / - Create a new game session.
   // ---------------------------------------------------------------------------
-  app.post('/:gameId/session', async (c) => {
+  app.post("/:gameId/session", async (c) => {
     const body = await c.req.json<CreateSessionRequest>();
     const { gameId } = c.req.param();
 
-    try {
-      const module = await loader.load(gameId);
-      const session = await sessions.createSession(gameId, module);
-
-      return c.json({
-        sessionId: session.id,
-        joinCode: session.joinCode,
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
-      return c.json({ error: msg }, 500);
+    // Allowlist check also keeps gameId from reaching the loader's file path unvetted.
+    if (!(await loader.listGames()).includes(gameId)) {
+      throw new SessionError("game-not-found", `Game "${gameId}" not found`);
     }
+    const module = await loader.load(gameId);
+    const session = await sessions.createSession(gameId, module);
+
+    return c.json({
+      sessionId: session.id,
+      joinCode: session.joinCode,
+    });
   });
 
   // ---------------------------------------------------------------------------
   // REST route: POST /:sessionId/join — Join a session, returns player token.
   // ---------------------------------------------------------------------------
-  app.post('/:sessionId/join', async (c) => {
+  app.post("/:sessionId/join", async (c) => {
     const { sessionId } = c.req.param();
-    const body = await c.req.json();
+    const body = await c.req.json().catch(() => {
+      throw new SessionError("invalid-request", "Malformed JSON body");
+    });
     const parsed = JoinSessionRequestSchema.safeParse(body);
     if (!parsed.success) {
-      return c.json(
-        { error: parsed.error.issues.map((i) => i.message).join(', ') } satisfies ServerErrorResponse,
-        400,
+      throw new SessionError(
+        "invalid-request",
+        parsed.error.issues.map((i) => i.message).join(", "),
       );
     }
     const { playerId, joinCode } = parsed.data;
     const session = sessions.getSession(sessionId);
     if (!session)
-      return c.json({ error: 'Session not found' } satisfies ServerErrorResponse, 404);
-    try {
-      const token = sessions.join(session, joinCode, playerId);
-      return c.json({ token } satisfies JoinSessionResponse);
-    } catch (e) {
-      if (e instanceof SessionError)
-        return c.json({ error: e.message } satisfies ServerErrorResponse, 400);
-      return c.json({ error: 'Unknown error' } satisfies ServerErrorResponse, 500);
-    }
-  });
-
-  // ---------------------------------------------------------------------------
-  // REST route: GET /:sessionId/state — Get current game state for a session.
-  // ---------------------------------------------------------------------------
-  app.get('/:sessionId/state', (c) => {
-    const session = sessions.getSession(c.req.param('sessionId'));
-    if (!session) return c.json({ error: 'Session not found' } satisfies ServerErrorResponse, 404);
-    if (!session.controller.isInitialized) return c.json({ state: null });
-    const state = session.controller.getState();
-    return c.json({ state });
-  });
-
-  // ---------------------------------------------------------------------------
-  // REST route: GET /:sessionId/prompts — Get current pending prompts for a session.
-  // ---------------------------------------------------------------------------
-  app.get('/:sessionId/prompts', (c) => {
-    const session = sessions.getSession(c.req.param('sessionId'));
-    if (!session) return c.json({ error: 'Session not found' } satisfies ServerErrorResponse, 404);
-    const prompts: Record<string, unknown> = {};
-    for (const [pid, prompt] of session.controller.pendingPrompts) {
-      prompts[pid] = prompt;
-    }
-    return c.json({ prompts });
+      throw new SessionError("session-not-found", "Session not found");
+    const token = await sessions.join(session, joinCode, playerId);
+    return c.json({ token } satisfies JoinSessionResponse);
   });
 
   return app;
