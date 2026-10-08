@@ -141,6 +141,21 @@ describe("SessionManager game start", () => {
       JSON.parse(JSON.stringify(session.controller.promptFor(awaited))),
     );
   });
+
+  it("delivers the initial turn only via sync, with no earlier turn frames", async () => {
+    const manager = new SessionManager();
+    const { session, sockets } = await startedSession(manager);
+    const turn = session.controller.currentTurn;
+    expect(turn).toEqual({ nodeId: expect.any(String), label: expect.any(String), actors: [awaitedPlayer(session)] });
+
+    for (const playerId of ["alice", "bob"]) {
+      const types = sockets[playerId].frames.map((f) => f.type);
+      expect(types).not.toContain("turn-start");
+      expect(types).not.toContain("turn-end");
+      const gameSync = sockets[playerId].frames.filter((f) => f.type === "sync").at(-1)!;
+      expect(gameSync.data.turn).toEqual(turn);
+    }
+  });
 });
 
 describe("SessionManager.submitPromptResponse", () => {
@@ -188,5 +203,28 @@ describe("SessionManager.submitPromptResponse", () => {
     expect(types).toContain("state-change");
     expect(types).toContain("prompt");
     expect(types.lastIndexOf("state-change")).toBeLessThan(types.indexOf("prompt"));
+  });
+
+  it("broadcasts turn-end then turn-start to every player, after the action's state changes", async () => {
+    const manager = new SessionManager();
+    const { session, sockets } = await startedSession(manager);
+    const first = awaitedPlayer(session);
+    const second = first === "alice" ? "bob" : "alice";
+    const value = (session.controller.promptFor(first)!.options as string[])[0];
+
+    await manager.submitPromptResponse(session.id, first, value);
+
+    for (const playerId of ["alice", "bob"]) {
+      const frames = framesAfterLastSync(sockets[playerId]);
+      const turnFrames = frames.filter((f) => f.type.startsWith("turn-"));
+      expect(turnFrames.map((f) => [f.type, f.data.actors])).toEqual([
+        ["turn-end", [first]],
+        ["turn-start", [second]],
+      ]);
+      const types = frames.map((f) => f.type);
+      expect(types.lastIndexOf("state-change")).toBeLessThan(types.indexOf("turn-end"));
+    }
+    const secondTypes = framesAfterLastSync(sockets[second]).map((f) => f.type);
+    expect(secondTypes.indexOf("turn-start")).toBeLessThan(secondTypes.indexOf("prompt"));
   });
 });

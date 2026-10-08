@@ -22,6 +22,8 @@ import {
   PromptServerMessage,
   StateChangeServerMessage,
   SyncServerMessage,
+  TurnEndServerMessage,
+  TurnStartServerMessage,
 } from "#chaincraft/api-types.js";
 import type {
   ErrorPayload,
@@ -143,6 +145,16 @@ export class SessionManager {
             data: outcome,
           } satisfies GameCompleteServerMessage),
         onStateChange: (changes) => this.pushStateChanges(sessionId, changes),
+        onTurnStart: (turn) =>
+          this.broadcastUnlessStarting(sessionId, {
+            type: "turn-start",
+            data: turn,
+          } satisfies TurnStartServerMessage),
+        onTurnEnd: (turn) =>
+          this.broadcastUnlessStarting(sessionId, {
+            type: "turn-end",
+            data: turn,
+          } satisfies TurnEndServerMessage),
       },
     });
 
@@ -226,6 +238,7 @@ export class SessionManager {
       const prompt = initialized
         ? session.controller.pendingPrompts.get(playerId)
         : undefined;
+      const turn = initialized ? session.controller.currentTurn : undefined;
       const playerInfo = session.players.get(playerId);
       const queuedMessages = playerInfo?.messageQueue ?? [];
 
@@ -236,6 +249,7 @@ export class SessionManager {
           data: {
             gameState: projectedState,
             prompt,
+            turn,
             messages: queuedMessages,
             stateChangeSeq: playerInfo?.stateChangeSeq ?? 0,
             messageSeq: playerInfo?.messageSeq ?? 0,
@@ -390,6 +404,7 @@ export class SessionManager {
           data: {
             gameState: session.controller.projectStateForPlayer(playerId),
             prompt,
+            turn: session.controller.currentTurn,
             messages: [],
             stateChangeSeq: playerInfo?.stateChangeSeq ?? 0,
             messageSeq: playerInfo?.messageSeq ?? 0,
@@ -485,6 +500,12 @@ export class SessionManager {
     for (const ws of session.sockets.values()) {
       ws.send(payload);
     }
+  }
+
+  /** Broadcast, except during init — the post-start sync carries the same information. */
+  private broadcastUnlessStarting(sessionId: string, message: unknown): void {
+    if (this.sessions.get(sessionId)?.starting) return;
+    this.broadcast(sessionId, message);
   }
 
   /** Generate a short random session id prefixed with the game ID. */

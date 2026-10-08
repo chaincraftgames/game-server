@@ -16,6 +16,7 @@ import type {
   Message,
   GameOutcome,
   ProjectedState,
+  TurnInfo,
 } from "@chaincraft/runtime";
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,8 @@ export interface SyncServerMessage {
   data: {
     gameState: ProjectedState | undefined;
     prompt: PlayerInputSuspension | undefined;
+    /** The active turn, or undefined between turns / before start / after completion. */
+    turn: TurnInfo | undefined;
     messages: Message[];
     stateChangeSeq: number;
     messageSeq: number;
@@ -219,11 +222,23 @@ export interface GameMessageServerMessage {
   data: Message;
 }
 
-/** Batch of state mutations from one action. */
+/** Batch of state mutations, split at turn boundaries. */
 export interface StateChangeServerMessage {
   type: "state-change";
   seq: number;
   data: StateChangeEvent[];
+}
+
+/** A turn started. Broadcast to all players. */
+export interface TurnStartServerMessage {
+  type: "turn-start";
+  data: TurnInfo;
+}
+
+/** A turn ended. Broadcast to all players. */
+export interface TurnEndServerMessage {
+  type: "turn-end";
+  data: TurnInfo;
 }
 
 /** Game has completed. */
@@ -264,6 +279,8 @@ export type ServerMessage =
   | PromptServerMessage
   | GameMessageServerMessage
   | StateChangeServerMessage
+  | TurnStartServerMessage
+  | TurnEndServerMessage
   | GameCompleteServerMessage
   | PlayerStatusUpdateMessage
   | GameErrorServerMessage;
