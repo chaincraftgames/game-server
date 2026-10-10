@@ -135,8 +135,8 @@ echo "  Once both are connected, send ready from each:"
 echo '    {"type":"player-status-update","data":{"id":"'"$PLAYER_1"'","status":"ready"}}'
 echo '    {"type":"player-status-update","data":{"id":"'"$PLAYER_2"'","status":"ready"}}'
 echo ""
-echo "  When a prompt arrives, respond with:"
-echo '    {"type":"prompt-response","data":{"value":"<your-choice>"}}'
+echo "  When a prompt arrives, respond with (promptId from the prompt or sync frame):"
+echo '    {"type":"prompt-response","data":{"promptId":<promptId>,"value":"<your-choice>"}}'
 echo ""
 
 # ---------------------------------------------------------------------------

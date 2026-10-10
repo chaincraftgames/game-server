@@ -137,9 +137,10 @@ describe("SessionManager game start", () => {
 
     const awaited = awaitedPlayer(session);
     const awaitedSync = sockets[awaited].frames.filter((f) => f.type === "sync").at(-1)!;
-    expect(awaitedSync.data.prompt).toEqual(
-      JSON.parse(JSON.stringify(session.controller.promptFor(awaited))),
-    );
+    expect(awaitedSync.data.prompt).toEqual({
+      ...JSON.parse(JSON.stringify(session.controller.promptFor(awaited))),
+      promptId: 1,
+    });
   });
 
   it("delivers the initial turn only via sync, with no earlier turn frames", async () => {
@@ -159,7 +160,11 @@ describe("SessionManager game start", () => {
 });
 
 describe("SessionManager.submitPromptResponse", () => {
-  it("rejects a response from a player with no pending prompt and leaves state untouched", async () => {
+  function firstOption(session: HostedSession, playerId: string): string {
+    return (session.controller.promptFor(playerId)!.options as string[])[0];
+  }
+
+  it("rejects a prompt id never issued to a player with no pending prompt and leaves state untouched", async () => {
     const manager = new SessionManager();
     const { session } = await startedSession(manager);
     const awaited = awaitedPlayer(session);
@@ -167,10 +172,76 @@ describe("SessionManager.submitPromptResponse", () => {
     const before = session.controller.getState();
 
     await expectSessionError(
-      manager.submitPromptResponse(session.id, other, "anything"),
-      "not-awaiting-input",
+      manager.submitPromptResponse(session.id, other, 1, "anything"),
+      "invalid-request",
     );
     expect(session.controller.getState()).toEqual(before);
+  });
+
+  it("rejects a prompt id ahead of the pending prompt and leaves state untouched", async () => {
+    const manager = new SessionManager();
+    const { session } = await startedSession(manager);
+    const awaited = awaitedPlayer(session);
+    const before = session.controller.getState();
+
+    await expectSessionError(
+      manager.submitPromptResponse(session.id, awaited, 2, firstOption(session, awaited)),
+      "invalid-request",
+    );
+    expect(session.controller.getState()).toEqual(before);
+  });
+
+  it("rejects a double-submit as stale-prompt and leaves state untouched", async () => {
+    const manager = new SessionManager();
+    const { session } = await startedSession(manager);
+    const first = awaitedPlayer(session);
+    const hand = session.controller.getState().players[first].inventories.hand;
+    const [cardA, cardB] = "pieceIds" in hand ? hand.pieceIds : [];
+
+    const a = manager.submitPromptResponse(session.id, first, 1, cardA);
+    const b = manager.submitPromptResponse(session.id, first, 1, cardB);
+
+    await expect(a).resolves.toBeUndefined();
+    const afterFirst = session.controller.getState();
+    await expectSessionError(b, "stale-prompt");
+    expect(session.controller.getState()).toEqual(afterFirst);
+  });
+
+  it("rejects a superseded prompt id as stale-prompt while a newer prompt is pending", async () => {
+    const manager = new SessionManager();
+    const { session } = await startedSession(manager);
+    const first = awaitedPlayer(session);
+    const second = first === "alice" ? "bob" : "alice";
+    await manager.submitPromptResponse(session.id, first, 1, firstOption(session, first));
+    await manager.submitPromptResponse(session.id, second, 1, firstOption(session, second));
+    // Both players have now been issued prompt 1, so whoever leads next holds prompt 2.
+    const next = awaitedPlayer(session);
+    const before = session.controller.getState();
+
+    await expectSessionError(
+      manager.submitPromptResponse(session.id, next, 1, firstOption(session, next)),
+      "stale-prompt",
+    );
+    expect(session.controller.getState()).toEqual(before);
+    await expect(
+      manager.submitPromptResponse(session.id, next, 2, firstOption(session, next)),
+    ).resolves.toBeUndefined();
+  });
+
+  it("numbers prompts per player and sends the id on prompt frames and reconnect sync", async () => {
+    const manager = new SessionManager();
+    const { session, sockets } = await startedSession(manager);
+    const first = awaitedPlayer(session);
+    const second = first === "alice" ? "bob" : "alice";
+
+    await manager.submitPromptResponse(session.id, first, 1, firstOption(session, first));
+
+    const promptFrames = framesAfterLastSync(sockets[second]).filter((f) => f.type === "prompt");
+    expect(promptFrames.map((f) => f.data.promptId)).toEqual([1]);
+
+    const reconnect = fakeSocket();
+    await manager.connect(session, second, reconnect.ws);
+    expect(reconnect.frames[0].data.prompt.promptId).toBe(1);
   });
 
   it("queues back-to-back responses so the second is checked against post-action state", async () => {
@@ -178,13 +249,13 @@ describe("SessionManager.submitPromptResponse", () => {
     const { session } = await startedSession(manager);
     const first = awaitedPlayer(session);
     const second = first === "alice" ? "bob" : "alice";
-    const firstValue = (session.controller.promptFor(first)!.options as string[])[0];
+    const firstValue = firstOption(session, first);
     const hand = session.controller.getState().players[second].inventories.hand;
     const secondValue = ("pieceIds" in hand ? hand.pieceIds : [])[0];
 
     // Second player has no prompt yet; it only becomes valid once the first action settles.
-    const a = manager.submitPromptResponse(session.id, first, firstValue);
-    const b = manager.submitPromptResponse(session.id, second, secondValue);
+    const a = manager.submitPromptResponse(session.id, first, 1, firstValue);
+    const b = manager.submitPromptResponse(session.id, second, 1, secondValue);
 
     await expect(a).resolves.toBeUndefined();
     await expect(b).resolves.toBeUndefined();
@@ -195,9 +266,9 @@ describe("SessionManager.submitPromptResponse", () => {
     const { session, sockets } = await startedSession(manager);
     const first = awaitedPlayer(session);
     const second = first === "alice" ? "bob" : "alice";
-    const value = (session.controller.promptFor(first)!.options as string[])[0];
+    const value = firstOption(session, first);
 
-    await manager.submitPromptResponse(session.id, first, value);
+    await manager.submitPromptResponse(session.id, first, 1, value);
 
     const types = framesAfterLastSync(sockets[second]).map((f) => f.type);
     expect(types).toContain("state-change");
@@ -210,9 +281,9 @@ describe("SessionManager.submitPromptResponse", () => {
     const { session, sockets } = await startedSession(manager);
     const first = awaitedPlayer(session);
     const second = first === "alice" ? "bob" : "alice";
-    const value = (session.controller.promptFor(first)!.options as string[])[0];
+    const value = firstOption(session, first);
 
-    await manager.submitPromptResponse(session.id, first, value);
+    await manager.submitPromptResponse(session.id, first, 1, value);
 
     for (const playerId of ["alice", "bob"]) {
       const frames = framesAfterLastSync(sockets[playerId]);

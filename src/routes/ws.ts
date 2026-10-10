@@ -98,6 +98,7 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
                 await sessions.submitPromptResponse(
                   sessionId,
                   playerId,
+                  msg.data.promptId,
                   msg.data.value,
                 );
                 break;

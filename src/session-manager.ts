@@ -29,6 +29,7 @@ import type {
   ErrorPayload,
   SessionErrorType,
   StateChangeEvent,
+  WirePrompt,
 } from "#chaincraft/api-types.js";
 
 /** Information about a player in a session. */
@@ -45,6 +46,8 @@ interface PlayerInfo {
   messageSeq: number;
   /** Per-viewer counter for state-change frames delivered to this player. */
   stateChangeSeq: number;
+  /** Id of the last prompt issued to this player; it is current while the player has a pending prompt. */
+  promptSeq: number;
 }
 
 export class SessionError extends Error {
@@ -236,7 +239,7 @@ export class SessionManager {
         ? session.controller.projectStateForPlayer(playerId)
         : undefined;
       const prompt = initialized
-        ? session.controller.pendingPrompts.get(playerId)
+        ? this.currentWirePrompt(session, playerId)
         : undefined;
       const turn = initialized ? session.controller.currentTurn : undefined;
       const playerInfo = session.players.get(playerId);
@@ -268,15 +271,27 @@ export class SessionManager {
   submitPromptResponse(
     sessionId: string,
     playerId: string,
+    promptId: number,
     value: unknown,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return Promise.reject(new SessionError("session-not-found"));
     return this.runExclusive(session, async () => {
-      if (!session.controller.pendingPrompts.has(playerId)) {
+      const playerInfo = session.players.get(playerId);
+      if (!playerInfo) throw new SessionError("player-not-joined");
+      if (promptId > playerInfo.promptSeq) {
         throw new SessionError(
-          "not-awaiting-input",
-          `No prompt is awaiting player "${playerId}"`,
+          "invalid-request",
+          `Prompt ${promptId} was never issued to player "${playerId}"`,
+        );
+      }
+      if (
+        promptId !== playerInfo.promptSeq ||
+        !session.controller.pendingPrompts.has(playerId)
+      ) {
+        throw new SessionError(
+          "stale-prompt",
+          `Prompt ${promptId} is no longer pending for player "${playerId}"`,
         );
       }
       await session.controller.processAction({ playerId, value });
@@ -315,6 +330,7 @@ export class SessionManager {
         messageQueue: [],
         messageSeq: 0,
         stateChangeSeq: 0,
+        promptSeq: 0,
       };
       session.players.set(playerId, playerInfo);
       this.broadcast(session.id, {
@@ -397,7 +413,7 @@ export class SessionManager {
   private syncAllPlayers(session: HostedSession): void {
     for (const [playerId, ws] of session.sockets) {
       const playerInfo = session.players.get(playerId);
-      const prompt = session.controller.pendingPrompts.get(playerId);
+      const prompt = this.currentWirePrompt(session, playerId);
       ws.send(
         JSON.stringify({
           type: "sync",
@@ -414,19 +430,35 @@ export class SessionManager {
     }
   }
 
-  /** Push a prompt to the player who is awaiting input. */
+  /** The player's pending prompt with its id, or undefined if none is pending. */
+  private currentWirePrompt(
+    session: HostedSession,
+    playerId: string,
+  ): WirePrompt | undefined {
+    const prompt = session.controller.pendingPrompts.get(playerId);
+    const playerInfo = session.players.get(playerId);
+    if (!prompt || !playerInfo) return undefined;
+    return { ...prompt, promptId: playerInfo.promptSeq };
+  }
+
+  /** Issue the next prompt id to the awaited player and push the prompt to them. */
   private pushPromptToAwaitedPlayers(
     sessionId: string,
     prompt: PlayerInputSuspension,
   ): void {
     const session = this.sessions.get(sessionId);
-    if (!session || session.starting) return;
+    if (!session) return;
+    const playerInfo = session.players.get(prompt.awaiting);
+    if (!playerInfo) return;
+    // Assigned even while starting: the post-start sync carries this id.
+    const promptId = ++playerInfo.promptSeq;
+    if (session.starting) return;
     const ws = session.sockets.get(prompt.awaiting);
     if (ws)
       ws.send(
         JSON.stringify({
           type: "prompt",
-          data: prompt,
+          data: { ...prompt, promptId },
         } satisfies PromptServerMessage),
       );
   }

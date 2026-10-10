@@ -178,6 +178,8 @@ export type PlayerStatusUpdateMessage = z.infer<typeof PlayerStatusUpdateMessage
 export const ClientPromptResponseMessage = z.object({
   type: z.literal("prompt-response"),
   data: z.object({
+    /** The `promptId` of the prompt being answered. */
+    promptId: z.number().int().positive(),
     value: z.unknown(),
   }),
 });
@@ -195,12 +197,15 @@ export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 // Server → Client messages (WS)
 // ---------------------------------------------------------------------------
 
+/** A prompt as sent to its player. `promptId` is per-player monotonic. */
+export type WirePrompt = PlayerInputSuspension & { promptId: number };
+
 /** Current game and session state sent when a player connects or reconnects. */
 export interface SyncServerMessage {
   type: "sync";
   data: {
     gameState: ProjectedState | undefined;
-    prompt: PlayerInputSuspension | undefined;
+    prompt: WirePrompt | undefined;
     /** The active turn, or undefined between turns / before start / after completion. */
     turn: TurnInfo | undefined;
     messages: Message[];
@@ -212,7 +217,7 @@ export interface SyncServerMessage {
 /** Server is prompting a player for input. */
 export interface PromptServerMessage {
   type: "prompt";
-  data: PlayerInputSuspension;
+  data: WirePrompt;
 }
 
 /** Server is sending a game message. */
@@ -254,7 +259,7 @@ export type SessionErrorType =
   | "join-code-not-found"
   | "player-not-joined"
   | "no-available-player-slots"
-  | "not-awaiting-input"
+  | "stale-prompt"
   | "unauthorized"
   | "invalid-message"
   | "invalid-request"
