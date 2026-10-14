@@ -3,20 +3,23 @@ import { Hono } from "hono";
 import { SessionManager } from "#chaincraft/session-manager.js";
 import { SpecModuleLoader } from "#chaincraft/spec-module-loader.js";
 import { createSessionRoutes } from "#chaincraft/routes/sessions.js";
+import { MAX_QUERIES } from "#chaincraft/api-types.js";
 
 const GAMES_DIR = fileURLToPath(new URL("../../../games", import.meta.url));
 
-function createApp() {
-  const sessions = new SessionManager();
+function createApp(sessions = new SessionManager()) {
   const app = new Hono();
   app.route("/sessions", createSessionRoutes(new SpecModuleLoader(GAMES_DIR), sessions));
   return app;
 }
 
-function postJson(app: Hono, path: string, body: unknown) {
+function postJson(app: Hono, path: string, body: unknown, token?: string) {
   return app.request(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token !== undefined && { Authorization: `Bearer ${token}` }),
+    },
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
 }
@@ -79,5 +82,85 @@ describe("REST session routes", () => {
     const { sessionId } = await createSession(app);
     expect((await app.request(`/sessions/${sessionId}/state`)).status).toBe(404);
     expect((await app.request(`/sessions/${sessionId}/prompts`)).status).toBe(404);
+  });
+});
+
+describe("REST POST /sessions/:sessionId/query", () => {
+  /** High Card with alice and bob joined over REST and the game started. */
+  async function startedGame() {
+    const sessions = new SessionManager();
+    const app = createApp(sessions);
+    const { sessionId, joinCode } = await createSession(app);
+    const tokens: Record<string, string> = {};
+    for (const playerId of ["alice", "bob"]) {
+      const res = await postJson(app, `/sessions/${sessionId}/join`, { playerId, joinCode });
+      tokens[playerId] = ((await res.json()) as { token: string }).token;
+    }
+    await sessions.updatePlayerStatus(sessionId, "alice", "ready");
+    await sessions.updatePlayerStatus(sessionId, "bob", "ready");
+    const session = sessions.getSession(sessionId)!;
+    const awaited = session.controller.currentPrompt!.awaiting;
+    const path = `/sessions/${sessionId}/query`;
+    return { app, session, tokens, awaited, path };
+  }
+
+  it("returns one result per query for the token's player", async () => {
+    const { app, session, tokens, awaited, path } = await startedGame();
+    const card = (session.controller.promptFor(awaited)!.options as string[])[0];
+
+    const res = await postJson(
+      app,
+      path,
+      { promptId: 1, queries: [{ responses: [card] }, { responses: ["not-a-card"] }] },
+      tokens[awaited],
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      results: [{ kind: "complete" }, { kind: "illegal", index: 0, inputId: "card" }],
+    });
+  });
+
+  it("requires a valid Bearer token for this session", async () => {
+    const { app, tokens, awaited, path } = await startedGame();
+    const other = await startedGame();
+    const body = { promptId: 1, queries: [{ responses: ["x"] }] };
+
+    await expectError(await postJson(app, path, body), 401, "unauthorized");
+    await expectError(await postJson(app, path, body, "not-a-token"), 401, "unauthorized");
+    await expectError(await postJson(app, path, body, other.tokens[other.awaited]), 401, "unauthorized");
+    await expectError(
+      await postJson(app, "/sessions/nope/query", body, tokens[awaited]),
+      401,
+      "unauthorized",
+    );
+  });
+
+  it("returns invalid-request for malformed, empty, or oversized batches", async () => {
+    const { app, tokens, awaited, path } = await startedGame();
+    const token = tokens[awaited];
+    const query = { responses: ["x"] };
+
+    await expectError(await postJson(app, path, "{not json", token), 400, "invalid-request");
+    await expectError(await postJson(app, path, { promptId: 1, queries: [] }, token), 400, "invalid-request");
+    await expectError(
+      await postJson(app, path, { promptId: 1, queries: Array(MAX_QUERIES + 1).fill(query) }, token),
+      400,
+      "invalid-request",
+    );
+    await expectError(
+      await postJson(app, path, { promptId: 1, queries: [{ responses: [] }] }, token),
+      400,
+      "invalid-request",
+    );
+  });
+
+  it("rejects a prompt id the player was never issued", async () => {
+    const { app, tokens, awaited, path } = await startedGame();
+    const idle = awaited === "alice" ? "bob" : "alice";
+
+    const res = await postJson(app, path, { promptId: 1, queries: [{ responses: ["x"] }] }, tokens[idle]);
+
+    await expectError(res, 400, "invalid-request");
   });
 });

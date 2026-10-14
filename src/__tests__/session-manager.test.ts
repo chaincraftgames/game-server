@@ -415,6 +415,80 @@ describe("SessionManager.submitPromptResponses — sequences (Liar's Dice makeBi
   });
 });
 
+describe("SessionManager.queryResponses (Liar's Dice makeBid)", () => {
+  const makeBid = { kind: "act", actionId: "makeBid" };
+  const bidMessage = "Bid a higher quantity, or the same quantity with a higher face value.";
+
+  /** Opening bid 3x4 placed; the second player holds prompt 1 (action-select). */
+  async function afterOpeningBid(manager: SessionManager) {
+    const started = await startedSession(manager, "liars-dice");
+    const first = awaitedPlayer(started.session);
+    const second = first === "alice" ? "bob" : "alice";
+    await manager.submitPromptResponses(started.session.id, first, 1, [3, 4]);
+    return { ...started, first, second };
+  }
+
+  it("reports where each sequence leads, with inputs stripped of compiled rules", async () => {
+    const manager = new SessionManager();
+    const { session, second } = await afterOpeningBid(manager);
+
+    const results = await manager.queryResponses(session, second, 1, [
+      [makeBid],
+      [makeBid, 3],
+      [makeBid, 3, 5],
+      [makeBid, 3, 2],
+      [{ kind: "act", actionId: "steal" }],
+    ]);
+
+    expect(results).toEqual([
+      {
+        kind: "next",
+        input: { id: "quantity", label: "Quantity", type: { kind: "number", min: 1, max: 30 } },
+        options: Array.from({ length: 28 }, (_, i) => i + 3),
+      },
+      {
+        kind: "next",
+        input: {
+          id: "faceValue",
+          label: "Face Value",
+          type: { kind: "number", min: 1, max: 6 },
+          validationMessage: bidMessage,
+          dependsOn: ["quantity"],
+        },
+        options: [5, 6],
+      },
+      { kind: "complete" },
+      { kind: "illegal", index: 2, inputId: "faceValue", message: bidMessage },
+      { kind: "illegal", index: 0 },
+    ]);
+  });
+
+  it("changes no state, sends no frames, and issues no prompt ids", async () => {
+    const manager = new SessionManager();
+    const { session, sockets, second } = await afterOpeningBid(manager);
+    const before = session.controller.getState();
+    const frameCounts = [sockets.alice.frames.length, sockets.bob.frames.length];
+
+    await manager.queryResponses(session, second, 1, [[makeBid, 3, 5], [makeBid, 4]]);
+
+    expect(session.controller.getState()).toEqual(before);
+    expect([sockets.alice.frames.length, sockets.bob.frames.length]).toEqual(frameCounts);
+    expect(session.players.get(second)!.promptSeq).toBe(1);
+    await expect(
+      manager.submitPromptResponses(session.id, second, 1, [makeBid, 3, 5]),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects prompt ids that were never issued or are no longer pending", async () => {
+    const manager = new SessionManager();
+    const { session, first, second } = await afterOpeningBid(manager);
+
+    await expectSessionError(manager.queryResponses(session, second, 2, [[makeBid]]), "invalid-request");
+    // first answered prompt 1 with the opening bid and has nothing pending.
+    await expectSessionError(manager.queryResponses(session, first, 1, [[makeBid]]), "stale-prompt");
+  });
+});
+
 describe("ClientMessageSchema prompt-response", () => {
   const parse = (data: unknown) => ClientMessageSchema.safeParse({ type: "prompt-response", data });
 

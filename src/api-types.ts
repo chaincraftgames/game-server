@@ -12,6 +12,8 @@
 
 import { z } from "zod";
 import type {
+  EngineInput,
+  InputOption,
   PlayerInputSuspension,
   Message,
   GameOutcome,
@@ -148,6 +150,45 @@ export interface JoinSessionResponse {
   token: string;
 }
 
+/** Action choice plus up to 4 player inputs. */
+export const MAX_PROMPT_RESPONSES = 5;
+
+/** Most response sequences one query request may carry. */
+export const MAX_QUERIES = 32;
+
+/**
+ * Asks what each response sequence would lead to if submitted for the pending prompt
+ * `promptId`, without applying any of them. Authenticated with `Authorization: Bearer <token>`.
+ */
+export const QueryRequestSchema = z.object({
+  promptId: z.number().int().positive(),
+  queries: z
+    .array(
+      z.object({
+        responses: z.array(z.unknown()).min(1).max(MAX_PROMPT_RESPONSES),
+      }),
+    )
+    .min(1)
+    .max(MAX_QUERIES),
+});
+export type QueryRequest = z.infer<typeof QueryRequestSchema>;
+
+/** What submitting one response sequence would lead to. */
+export type QueryResult =
+  /** The sequence is legal so far; this input would be requested next. */
+  | { kind: "next"; input: RequestedInput; options?: InputOption[] }
+  /** The sequence completes the action. */
+  | { kind: "complete" }
+  /** The sequence is legal, but the next input can only be requested after effects run. */
+  | { kind: "boundary" }
+  /** The answer at `index` would be rejected; same details as an illegal-action error. */
+  | { kind: "illegal"; index: number; inputId?: string; message?: string };
+
+/** Response to a query request: one result per query, in order. */
+export interface QueryResponse {
+  results: QueryResult[];
+}
+
 /** Error response from the server. Same payload as the WS `error` frame's data. */
 export interface ServerErrorResponse {
   error: ErrorPayload;
@@ -169,9 +210,6 @@ export const PlayerStatusUpdateMessage = z.object({
   }),
 });
 export type PlayerStatusUpdateMessage = z.infer<typeof PlayerStatusUpdateMessage>;
-
-/** Action choice plus up to 4 player inputs. */
-export const MAX_PROMPT_RESPONSES = 5;
 
 /**
  * Player submits answers starting at a pending prompt: the prompt's answer, then answers to
@@ -201,15 +239,31 @@ export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 // Server → Client messages (WS)
 // ---------------------------------------------------------------------------
 
-/** A prompt as sent to its player. `promptId` is per-player monotonic. */
-export type WirePrompt = PlayerInputSuspension & { promptId: number };
+/** An input as requested from a player: the engine's input with its compiled rules removed. */
+export interface RequestedInput {
+  id: string;
+  label?: string;
+  type: RequestedInputType;
+  validationMessage?: string;
+  /** Earlier inputs of the same action whose answers change this input's options. */
+  dependsOn?: readonly string[];
+}
+
+type WithoutFilter<T> = T extends unknown ? Omit<T, "filter"> : never;
+export type RequestedInputType = WithoutFilter<EngineInput["type"]>;
+
+/** A prompt as issued to its player. `promptId` is per-player monotonic. */
+export type IssuedPrompt = Omit<PlayerInputSuspension, "input"> & {
+  input: RequestedInput;
+  promptId: number;
+};
 
 /** Current game and session state sent when a player connects or reconnects. */
 export interface SyncServerMessage {
   type: "sync";
   data: {
     gameState: ProjectedState | undefined;
-    prompt: WirePrompt | undefined;
+    prompt: IssuedPrompt | undefined;
     /** The active turn, or undefined between turns / before start / after completion. */
     turn: TurnInfo | undefined;
     messages: Message[];
@@ -221,7 +275,7 @@ export interface SyncServerMessage {
 /** Server is prompting a player for input. */
 export interface PromptServerMessage {
   type: "prompt";
-  data: WirePrompt;
+  data: IssuedPrompt;
 }
 
 /** Server is sending a game message. */

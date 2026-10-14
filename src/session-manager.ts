@@ -14,7 +14,12 @@ import type {
   Message,
   PlayerCount,
 } from "@chaincraft/runtime";
-import type { PlayerInputSuspension, GameOutcome } from "@chaincraft/runtime";
+import type {
+  EngineInput,
+  PlayerInputSuspension,
+  GameOutcome,
+  WalkResult,
+} from "@chaincraft/runtime";
 import {
   GameCompleteServerMessage,
   GameMessageServerMessage,
@@ -27,9 +32,12 @@ import {
 } from "#chaincraft/api-types.js";
 import type {
   ErrorPayload,
+  IssuedPrompt,
+  QueryResult,
+  RequestedInput,
+  RequestedInputType,
   SessionErrorType,
   StateChangeEvent,
-  WirePrompt,
 } from "#chaincraft/api-types.js";
 
 /** Information about a player in a session. */
@@ -91,6 +99,42 @@ export function toErrorPayload(
   return {
     code: fallback,
     message: e instanceof Error ? e.message : "Unknown error",
+  };
+}
+
+/** The input as shown to the player; compiled filter/validate functions never leave the server. */
+function toRequestedInput(input: EngineInput): RequestedInput {
+  const { filter: _filter, ...type } = input.type as EngineInput["type"] & {
+    filter?: unknown;
+  };
+  const def = input as Partial<RequestedInput>;
+  return {
+    id: input.id,
+    ...(input.label !== undefined && { label: input.label }),
+    type: type as RequestedInputType,
+    ...(def.validationMessage !== undefined && {
+      validationMessage: def.validationMessage,
+    }),
+    ...(def.dependsOn !== undefined && { dependsOn: def.dependsOn }),
+  };
+}
+
+function toQueryResult(walk: WalkResult): QueryResult {
+  if (walk.kind === "illegal") {
+    return {
+      kind: "illegal",
+      index: walk.index,
+      ...(walk.inputId !== undefined && { inputId: walk.inputId }),
+      ...(walk.message !== undefined && { message: walk.message }),
+    };
+  }
+  if (walk.next === "complete" || walk.next === "boundary") {
+    return { kind: walk.next };
+  }
+  return {
+    kind: "next",
+    input: toRequestedInput(walk.next.input),
+    ...(walk.next.options !== undefined && { options: walk.next.options }),
   };
 }
 
@@ -233,6 +277,21 @@ export class SessionManager {
   }
 
   /**
+   * Resolve a player token to its session and player. Unknown sessions are also
+   * "unauthorized" so the endpoint doesn't reveal which session ids exist.
+   */
+  authenticateToken(
+    sessionId: string,
+    playerToken: string,
+  ): { session: HostedSession; playerId: string } {
+    const session = this.sessions.get(sessionId);
+    const playerId = session?.playerIdsByPlayerToken.get(playerToken);
+    if (!session || playerId === undefined)
+      throw new SessionError("unauthorized", "Invalid player token");
+    return { session, playerId };
+  }
+
+  /**
    * Register an authenticated player's WebSocket and send them a sync. Queued so the
    * sync is a consistent cut: never taken mid-action, and every later frame follows it.
    */
@@ -250,7 +309,7 @@ export class SessionManager {
         ? session.controller.projectStateForPlayer(playerId)
         : undefined;
       const prompt = initialized
-        ? this.currentWirePrompt(session, playerId)
+        ? this.currentIssuedPrompt(session, playerId)
         : undefined;
       const turn = initialized ? session.controller.currentTurn : undefined;
       const playerInfo = session.players.get(playerId);
@@ -288,25 +347,49 @@ export class SessionManager {
     const session = this.sessions.get(sessionId);
     if (!session) return Promise.reject(new SessionError("session-not-found"));
     return this.runExclusive(session, async () => {
-      const playerInfo = session.players.get(playerId);
-      if (!playerInfo) throw new SessionError("player-not-joined");
-      if (promptId > playerInfo.promptSeq) {
-        throw new SessionError(
-          "invalid-request",
-          `Prompt ${promptId} was never issued to player "${playerId}"`,
-        );
-      }
-      if (
-        promptId !== playerInfo.promptSeq ||
-        !session.controller.pendingPrompts.has(playerId)
-      ) {
-        throw new SessionError(
-          "stale-prompt",
-          `Prompt ${promptId} is no longer pending for player "${playerId}"`,
-        );
-      }
+      this.assertPromptPending(session, playerId, promptId);
       await session.controller.processResponses(playerId, responses);
     });
+  }
+
+  /** Judge each response sequence against the pending prompt without applying any of them. */
+  queryResponses(
+    session: HostedSession,
+    playerId: string,
+    promptId: number,
+    queries: readonly (readonly unknown[])[],
+  ): Promise<QueryResult[]> {
+    return this.runExclusive(session, () => {
+      this.assertPromptPending(session, playerId, promptId);
+      return queries.map((responses) =>
+        toQueryResult(session.controller.queryResponses(playerId, responses)),
+      );
+    });
+  }
+
+  /** Throws unless `promptId` is the player's current, still-pending prompt. */
+  private assertPromptPending(
+    session: HostedSession,
+    playerId: string,
+    promptId: number,
+  ): void {
+    const playerInfo = session.players.get(playerId);
+    if (!playerInfo) throw new SessionError("player-not-joined");
+    if (promptId > playerInfo.promptSeq) {
+      throw new SessionError(
+        "invalid-request",
+        `Prompt ${promptId} was never issued to player "${playerId}"`,
+      );
+    }
+    if (
+      promptId !== playerInfo.promptSeq ||
+      !session.controller.pendingPrompts.has(playerId)
+    ) {
+      throw new SessionError(
+        "stale-prompt",
+        `Prompt ${promptId} is no longer pending for player "${playerId}"`,
+      );
+    }
   }
 
   /** Remove the WebSocket associated with the given player in the specified session. */
@@ -424,7 +507,7 @@ export class SessionManager {
   private syncAllPlayers(session: HostedSession): void {
     for (const [playerId, ws] of session.sockets) {
       const playerInfo = session.players.get(playerId);
-      const prompt = this.currentWirePrompt(session, playerId);
+      const prompt = this.currentIssuedPrompt(session, playerId);
       ws.send(
         JSON.stringify({
           type: "sync",
@@ -442,14 +525,18 @@ export class SessionManager {
   }
 
   /** The player's pending prompt with its id, or undefined if none is pending. */
-  private currentWirePrompt(
+  private currentIssuedPrompt(
     session: HostedSession,
     playerId: string,
-  ): WirePrompt | undefined {
+  ): IssuedPrompt | undefined {
     const prompt = session.controller.pendingPrompts.get(playerId);
     const playerInfo = session.players.get(playerId);
     if (!prompt || !playerInfo) return undefined;
-    return { ...prompt, promptId: playerInfo.promptSeq };
+    return {
+      ...prompt,
+      input: toRequestedInput(prompt.input),
+      promptId: playerInfo.promptSeq,
+    };
   }
 
   /** Issue the next prompt id to the awaited player and push the prompt to them. */
@@ -469,7 +556,11 @@ export class SessionManager {
       ws.send(
         JSON.stringify({
           type: "prompt",
-          data: { ...prompt, promptId },
+          data: {
+            ...prompt,
+            input: toRequestedInput(prompt.input),
+            promptId,
+          },
         } satisfies PromptServerMessage),
       );
   }
