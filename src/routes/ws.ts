@@ -70,22 +70,31 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
             });
             return;
           }
+          let raw: unknown;
           try {
-            const raw = JSON.parse(
+            raw = JSON.parse(
               typeof evt.data === "string" ? evt.data : evt.data.toString(),
             );
+          } catch {
+            sendError(wsContext, {
+              code: "invalid-request",
+              message: "Malformed JSON message",
+            });
+            return;
+          }
 
-            // Validate incoming message against the schema
-            const parsed = ClientMessageSchema.safeParse(raw);
-            if (!parsed.success) {
-              sendError(wsContext, {
-                code: "invalid-request",
-                message: `Invalid message: ${parsed.error.issues.map((i) => i.message).join(", ")}`,
-              });
-              return;
-            }
+          // Validate incoming message against the schema
+          const parsed = ClientMessageSchema.safeParse(raw);
+          if (!parsed.success) {
+            sendError(wsContext, {
+              code: "invalid-request",
+              message: `Invalid message: ${parsed.error.issues.map((i) => i.message).join(", ")}`,
+            });
+            return;
+          }
 
-            const msg = parsed.data;
+          const msg = parsed.data;
+          try {
             switch (msg.type) {
               case "player-status-update":
                 await sessions.updatePlayerStatus(
@@ -95,19 +104,21 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
                 );
                 break;
               case "prompt-response":
-                await sessions.submitPromptResponse(
+                await sessions.submitPromptResponses(
                   sessionId,
                   playerId,
                   msg.data.promptId,
-                  msg.data.value,
+                  msg.data.responses,
                 );
                 break;
               default:
                 msg satisfies never;
             }
           } catch (e) {
-            // Runtime input rejections are plain Errors until WS3 adds illegal-action.
-            sendError(wsContext, toErrorPayload(e, "invalid-request"));
+            const payload = toErrorPayload(e, "internal-error");
+            if (payload.code === "internal-error")
+              console.error("WS message failed", e);
+            sendError(wsContext, payload);
           }
         },
 

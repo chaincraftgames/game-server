@@ -170,17 +170,21 @@ export const PlayerStatusUpdateMessage = z.object({
 });
 export type PlayerStatusUpdateMessage = z.infer<typeof PlayerStatusUpdateMessage>;
 
+/** Action choice plus up to 4 player inputs. */
+export const MAX_PROMPT_RESPONSES = 5;
+
 /**
- * Player submits a response to a pending prompt.
- * `value` is the player's answer — its shape matches the prompt's input type
- * (e.g. a piece ID string for gamepiece-select, an action ID string for action-select).
+ * Player submits answers starting at a pending prompt: the prompt's answer, then answers to
+ * the prompts that would follow within the same action. Each answer's shape matches its
+ * input type (e.g. a piece ID for gamepiece-select, an action choice for action-select).
+ * All-or-nothing: any illegal answer rejects the whole submission.
  */
 export const ClientPromptResponseMessage = z.object({
   type: z.literal("prompt-response"),
   data: z.object({
     /** The `promptId` of the prompt being answered. */
     promptId: z.number().int().positive(),
-    value: z.unknown(),
+    responses: z.array(z.unknown()).min(1).max(MAX_PROMPT_RESPONSES),
   }),
 });
 export type ClientPromptResponseMessage = z.infer<typeof ClientPromptResponseMessage>;
@@ -260,6 +264,7 @@ export type SessionErrorType =
   | "player-not-joined"
   | "no-available-player-slots"
   | "stale-prompt"
+  | "illegal-action"
   | "unauthorized"
   | "invalid-message"
   | "invalid-request"

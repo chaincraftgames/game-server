@@ -8,7 +8,7 @@
 
 import type { WSContext } from "hono/ws";
 
-import { GameController } from "@chaincraft/runtime";
+import { GameController, IllegalActionError } from "@chaincraft/runtime";
 import type {
   CompiledGameModule,
   Message,
@@ -73,6 +73,17 @@ export function toErrorPayload(
     return e.details === undefined
       ? { code: e.errorType, message: e.message }
       : { code: e.errorType, message: e.message, details: e.details };
+  }
+  if (e instanceof IllegalActionError) {
+    return {
+      code: "illegal-action",
+      message: e.message,
+      details: {
+        index: e.index,
+        ...(e.inputId !== undefined && { inputId: e.inputId }),
+        ...(e.validationMessage !== undefined && { message: e.validationMessage }),
+      },
+    };
   }
   if (fallback === "internal-error") {
     return { code: fallback, message: "Internal server error" };
@@ -267,12 +278,12 @@ export class SessionManager {
     });
   }
 
-  /** Apply a player's answer to their pending prompt. */
-  submitPromptResponse(
+  /** Apply a player's answer sequence, starting at their pending prompt. */
+  submitPromptResponses(
     sessionId: string,
     playerId: string,
     promptId: number,
-    value: unknown,
+    responses: readonly unknown[],
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return Promise.reject(new SessionError("session-not-found"));
@@ -294,7 +305,7 @@ export class SessionManager {
           `Prompt ${promptId} is no longer pending for player "${playerId}"`,
         );
       }
-      await session.controller.processAction({ playerId, value });
+      await session.controller.processResponses(playerId, responses);
     });
   }
 

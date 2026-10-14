@@ -136,7 +136,7 @@ echo '    {"type":"player-status-update","data":{"id":"'"$PLAYER_1"'","status":"
 echo '    {"type":"player-status-update","data":{"id":"'"$PLAYER_2"'","status":"ready"}}'
 echo ""
 echo "  When a prompt arrives, respond with (promptId from the prompt or sync frame):"
-echo '    {"type":"prompt-response","data":{"promptId":<promptId>,"value":"<your-choice>"}}'
+echo '    {"type":"prompt-response","data":{"promptId":<promptId>,"responses":["<your-choice>"]}}'
 echo ""
 
 # ---------------------------------------------------------------------------
