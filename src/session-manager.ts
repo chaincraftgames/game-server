@@ -8,7 +8,11 @@
 
 import type { WSContext } from "hono/ws";
 
-import { GameController, IllegalActionError } from "@chaincraft/runtime";
+import {
+  GameController,
+  IllegalActionError,
+  UndoNotAllowedError,
+} from "@chaincraft/runtime";
 import type {
   CompiledGameModule,
   Message,
@@ -21,6 +25,7 @@ import type {
   WalkResult,
 } from "@chaincraft/runtime";
 import {
+  ActionForfeitedServerMessage,
   GameCompleteServerMessage,
   GameMessageServerMessage,
   PlayerStatusUpdateMessage,
@@ -35,7 +40,6 @@ import type {
   IssuedPrompt,
   QueryResult,
   RequestedInput,
-  RequestedInputType,
   SessionErrorType,
   StateChangeEvent,
 } from "#chaincraft/api-types.js";
@@ -93,6 +97,9 @@ export function toErrorPayload(
       },
     };
   }
+  if (e instanceof UndoNotAllowedError) {
+    return { code: "cannot-undo", message: e.message };
+  }
   if (fallback === "internal-error") {
     return { code: fallback, message: "Internal server error" };
   }
@@ -102,16 +109,13 @@ export function toErrorPayload(
   };
 }
 
-/** The input as shown to the player; compiled filter/validate functions never leave the server. */
+/** The input as shown to the player; the compiled `validate` function never leaves the server. */
 function toRequestedInput(input: EngineInput): RequestedInput {
-  const { filter: _filter, ...type } = input.type as EngineInput["type"] & {
-    filter?: unknown;
-  };
   const def = input as Partial<RequestedInput>;
   return {
     id: input.id,
     ...(input.label !== undefined && { label: input.label }),
-    type: type as RequestedInputType,
+    type: input.type,
     ...(def.validationMessage !== undefined && {
       validationMessage: def.validationMessage,
     }),
@@ -203,6 +207,8 @@ export class SessionManager {
             data: outcome,
           } satisfies GameCompleteServerMessage),
         onStateChange: (changes) => this.pushStateChanges(sessionId, changes),
+        onActionForfeit: ({ playerId, actionId, inputId }) =>
+          this.pushActionForfeit(sessionId, playerId, actionId, inputId),
         onTurnStart: (turn) =>
           this.broadcastUnlessStarting(sessionId, {
             type: "turn-start",
@@ -349,6 +355,22 @@ export class SessionManager {
     return this.runExclusive(session, async () => {
       this.assertPromptPending(session, playerId, promptId);
       await session.controller.processResponses(playerId, responses);
+    });
+  }
+
+  /** Take back the player's last answer in the current action segment; the re-prompt goes out as a new prompt. */
+  undo(sessionId: string, playerId: string, promptId: number): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return Promise.reject(new SessionError("session-not-found"));
+    return this.runExclusive(session, async () => {
+      this.assertPromptPending(session, playerId, promptId);
+      if (!session.controller.canUndo(playerId)) {
+        throw new SessionError(
+          "cannot-undo",
+          `Prompt ${promptId} has nothing to undo for player "${playerId}"`,
+        );
+      }
+      await session.controller.undo(playerId);
     });
   }
 
@@ -536,6 +558,7 @@ export class SessionManager {
       ...prompt,
       input: toRequestedInput(prompt.input),
       promptId: playerInfo.promptSeq,
+      canUndo: session.controller.canUndo(playerId),
     };
   }
 
@@ -560,6 +583,7 @@ export class SessionManager {
             ...prompt,
             input: toRequestedInput(prompt.input),
             promptId,
+            canUndo: session.controller.canUndo(prompt.awaiting),
           },
         } satisfies PromptServerMessage),
       );
@@ -624,6 +648,23 @@ export class SessionManager {
         } satisfies StateChangeServerMessage),
       );
     }
+  }
+
+  /** Tell the actor their action was forfeited; other players just see the turn continue. */
+  private pushActionForfeit(
+    sessionId: string,
+    playerId: string,
+    actionId: string | undefined,
+    inputId: string,
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.starting) return;
+    session.sockets.get(playerId)?.send(
+      JSON.stringify({
+        type: "action-forfeited",
+        data: { actionId, inputId },
+      } satisfies ActionForfeitedServerMessage),
+    );
   }
 
   /** Send a message to all players in the session. */

@@ -153,6 +153,7 @@ describe("SessionManager game start", () => {
     expect(awaitedSync.data.prompt).toEqual({
       ...JSON.parse(JSON.stringify(session.controller.promptFor(awaited))),
       promptId: 1,
+      canUndo: false,
     });
   });
 
@@ -486,6 +487,102 @@ describe("SessionManager.queryResponses (Liar's Dice makeBid)", () => {
     await expectSessionError(manager.queryResponses(session, second, 2, [[makeBid]]), "invalid-request");
     // first answered prompt 1 with the opening bid and has nothing pending.
     await expectSessionError(manager.queryResponses(session, first, 1, [[makeBid]]), "stale-prompt");
+  });
+});
+
+describe("ClientMessageSchema undo", () => {
+  const parse = (data: unknown) => ClientMessageSchema.safeParse({ type: "undo", data });
+
+  it("accepts a positive integer prompt id", () => {
+    expect(parse({ promptId: 3 }).success).toBe(true);
+  });
+
+  it("rejects a missing, zero, or non-integer prompt id", () => {
+    expect(parse({}).success).toBe(false);
+    expect(parse({ promptId: 0 }).success).toBe(false);
+    expect(parse({ promptId: 1.5 }).success).toBe(false);
+  });
+});
+
+describe("SessionManager.undo (Liar's Dice makeBid)", () => {
+  const makeBid = { kind: "act", actionId: "makeBid" };
+
+  function promptFrames(socket: FakeSocket) {
+    return framesAfterLastSync(socket).filter((f) => f.type === "prompt");
+  }
+
+  async function liarsDice(manager: SessionManager) {
+    const started = await startedSession(manager, "liars-dice");
+    const first = awaitedPlayer(started.session);
+    const second = first === "alice" ? "bob" : "alice";
+    return { ...started, first, second };
+  }
+
+  it("re-prompts the taken-back input with a new prompt id and flags canUndo on each prompt", async () => {
+    const manager = new SessionManager();
+    const { session, sockets, first } = await liarsDice(manager);
+
+    await manager.submitPromptResponses(session.id, first, 1, [3]);
+    expect(promptFrames(sockets[first]).map((f) => [f.data.promptId, f.data.input.id, f.data.canUndo])).toEqual([
+      [2, "faceValue", true],
+    ]);
+
+    await manager.undo(session.id, first, 2);
+    expect(promptFrames(sockets[first]).map((f) => [f.data.promptId, f.data.input.id, f.data.canUndo])).toEqual([
+      [2, "faceValue", true],
+      [3, "quantity", false],
+    ]);
+    expect(session.controller.currentPrompt!.input.id).toBe("quantity");
+  });
+
+  it("rejects a stale prompt id and leaves the pending prompt untouched", async () => {
+    const manager = new SessionManager();
+    const { session, first } = await liarsDice(manager);
+    await manager.submitPromptResponses(session.id, first, 1, [3]);
+
+    await expectSessionError(manager.undo(session.id, first, 1), "stale-prompt");
+    expect(session.controller.currentPrompt!.input.id).toBe("faceValue");
+    expect(session.players.get(first)!.promptSeq).toBe(2);
+  });
+
+  it("rejects with cannot-undo when there is nothing to take back", async () => {
+    const manager = new SessionManager();
+    const { session, first } = await liarsDice(manager);
+    const before = session.controller.getState();
+
+    await expectSessionError(manager.undo(session.id, first, 1), "cannot-undo");
+    expect(session.controller.getState()).toEqual(before);
+    expect(session.players.get(first)!.promptSeq).toBe(1);
+  });
+
+  it("takes back the action choice, but not before one is made", async () => {
+    const manager = new SessionManager();
+    const { session, sockets, first, second } = await liarsDice(manager);
+    await manager.submitPromptResponses(session.id, first, 1, [3, 4]);
+
+    await expectSessionError(manager.undo(session.id, second, 1), "cannot-undo");
+
+    await manager.submitPromptResponses(session.id, second, 1, [makeBid]);
+    const quantity = promptFrames(sockets[second]).at(-1)!;
+    expect([quantity.data.promptId, quantity.data.input.id, quantity.data.canUndo]).toEqual([2, "quantity", true]);
+
+    await manager.undo(session.id, second, 2);
+    const reselect = promptFrames(sockets[second]).at(-1)!;
+    expect([reselect.data.promptId, reselect.data.input.type.kind, reselect.data.canUndo]).toEqual([
+      3,
+      "action-select",
+      false,
+    ]);
+  });
+
+  it("includes canUndo on the reconnect sync prompt", async () => {
+    const manager = new SessionManager();
+    const { session, first } = await liarsDice(manager);
+    await manager.submitPromptResponses(session.id, first, 1, [3]);
+
+    const reconnect = fakeSocket();
+    await manager.connect(session, first, reconnect.ws);
+    expect(reconnect.frames[0].data.prompt).toMatchObject({ promptId: 2, canUndo: true });
   });
 });
 

@@ -111,6 +111,9 @@ export function registerWsRoute(app: Hono, sessions: SessionManager) {
                   msg.data.responses,
                 );
                 break;
+              case "undo":
+                await sessions.undo(sessionId, playerId, msg.data.promptId);
+                break;
               default:
                 msg satisfies never;
             }

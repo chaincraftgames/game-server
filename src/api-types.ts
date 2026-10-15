@@ -227,10 +227,21 @@ export const ClientPromptResponseMessage = z.object({
 });
 export type ClientPromptResponseMessage = z.infer<typeof ClientPromptResponseMessage>;
 
+/** Player takes back their last answer in the current action segment (or the action choice) and is re-prompted. */
+export const ClientUndoMessage = z.object({
+  type: z.literal("undo"),
+  data: z.object({
+    /** The `promptId` of the player's pending prompt. */
+    promptId: z.number().int().positive(),
+  }),
+});
+export type ClientUndoMessage = z.infer<typeof ClientUndoMessage>;
+
 /** Discriminated union of all client → server message shapes. */
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   PlayerStatusUpdateMessage,
   ClientPromptResponseMessage,
+  ClientUndoMessage,
 ]);
 
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
@@ -249,13 +260,14 @@ export interface RequestedInput {
   dependsOn?: readonly string[];
 }
 
-type WithoutFilter<T> = T extends unknown ? Omit<T, "filter"> : never;
-export type RequestedInputType = WithoutFilter<EngineInput["type"]>;
+export type RequestedInputType = EngineInput["type"];
 
 /** A prompt as issued to its player. `promptId` is per-player monotonic. */
 export type IssuedPrompt = Omit<PlayerInputSuspension, "input"> & {
   input: RequestedInput;
   promptId: number;
+  /** Whether an `undo` message would currently be accepted for this prompt. */
+  canUndo: boolean;
 };
 
 /** Current game and session state sent when a player connects or reconnects. */
@@ -304,6 +316,12 @@ export interface TurnEndServerMessage {
   data: TurnInfo;
 }
 
+/** The actor's action was abandoned: an input had no valid answer after earlier effects ran. Actor only. */
+export interface ActionForfeitedServerMessage {
+  type: "action-forfeited";
+  data: { actionId: string | undefined; inputId: string };
+}
+
 /** Game has completed. */
 export interface GameCompleteServerMessage {
   type: "complete";
@@ -319,6 +337,7 @@ export type SessionErrorType =
   | "no-available-player-slots"
   | "stale-prompt"
   | "illegal-action"
+  | "cannot-undo"
   | "unauthorized"
   | "invalid-message"
   | "invalid-request"
@@ -345,6 +364,7 @@ export type ServerMessage =
   | StateChangeServerMessage
   | TurnStartServerMessage
   | TurnEndServerMessage
+  | ActionForfeitedServerMessage
   | GameCompleteServerMessage
   | PlayerStatusUpdateMessage
   | GameErrorServerMessage;
