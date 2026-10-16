@@ -63,7 +63,7 @@ export interface PieceFlippedEvent {
 export interface PieceRolledEvent {
   kind: "piece:rolled";
   pieceId: string;
-  faceValue: number;
+  faceValue: number | string;
 }
 
 export interface PieceOrientedEvent {
